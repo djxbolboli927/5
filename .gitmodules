@@ -1,0 +1,3 @@
+[submodule "vendor/litesvm"]
+	path = vendor/litesvm
+	url = https://github.com/LiteSVM/litesvm

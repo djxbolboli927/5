@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+import "packet.proto";
+import "shared.proto";
+
+package bundle;
+
+message Bundle {
+  shared.Header header = 2;
+  repeated packet.Packet packets = 3;
+}
+
+message BundleUuid {
+  bundle.Bundle bundle = 1;
+  string uuid = 2;
+}
+
+message Accepted {
+  uint64 slot = 1;
+  string validator_identity = 2;
+}
+
+message Rejected {
+  oneof reason {
+    StateAuctionBidRejected state_auction_bid_rejected = 1;
+    WinningBatchBidRejected winning_batch_bid_rejected = 2;
+    SimulationFailure simulation_failure = 3;
+    InternalError internal_error = 4;
+    DroppedBundle dropped_bundle = 5;
+  }
+}
+
+message WinningBatchBidRejected {
+  string auction_id = 1;
+  uint64 simulated_bid_lamports = 2;
+  optional string msg = 3;
+}
+
+message StateAuctionBidRejected {
+  string auction_id = 1;
+  uint64 simulated_bid_lamports = 2;
+  optional string msg = 3;
+}
+
+message SimulationFailure {
+  string tx_signature = 1;
+  optional string msg = 2;
+}
+
+message InternalError {
+  string msg = 1;
+}
+
+message DroppedBundle {
+  string msg = 1;
+}
+
+message Finalized {}
+
+message Processed {
+  string validator_identity = 1;
+  uint64 slot = 2;
+  uint64 bundle_index = 3;
+}
+
+message Dropped {
+  DroppedReason reason = 1;
+}
+
+enum DroppedReason {
+  BlockhashExpired = 0;
+  PartiallyProcessed = 1;
+  NotFinalized = 2;
+}
+
+message BundleResult {
+  string bundle_id = 1;
+  oneof result {
+    Accepted accepted = 2;
+    Rejected rejected = 3;
+    Finalized finalized = 4;
+    Processed processed = 5;
+    Dropped dropped = 6;
+  }
+}

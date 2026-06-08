@@ -1,0 +1,156 @@
+[metis]
+url = "http://127.0.0.1:8080"
+binary_key = "5b945476-f95d-4403-a2b5-156db4ee3212"
+
+[trading]
+min_amount_sol = 0.001
+max_amount_sol = 0.1
+step_sol = 0.0002
+# حداقل سود ناخالص (lamport) برای عبور از Stage 1.
+# فقط روی تعداد profitable و ارسال به swap_instructions تأثیر دارد.
+# خروجی نهایی on-chain همچنان ورودی + 10000 لمپرت باقی می‌ماند.
+# مثال: 6600 = فقط فرصت‌هایی که هزینه‌ها را پوشش می‌دهند
+#        100000 = فقط فرصت‌های با سود بالا
+min_profit_lamports = 6600
+base_fee_lamports = 5000
+tokens_file = "tokens.txt"
+
+[jito]
+# باندل به طور همزمان به همه 8 ریجن Jito ارسال می‌شود.
+# ریت لیمیت 5/sec روی هر endpoint جداگانه اعمال می‌شود،
+# پس افزودن ریجن هزینه rate-limit ندارد — فقط افزایش پوشش جغرافیایی.
+urls = [
+    "https://amsterdam.mainnet.block-engine.jito.wtf",
+    "https://dublin.mainnet.block-engine.jito.wtf",
+    "https://frankfurt.mainnet.block-engine.jito.wtf",
+    "https://london.mainnet.block-engine.jito.wtf",
+    "https://ny.mainnet.block-engine.jito.wtf",
+    "https://slc.mainnet.block-engine.jito.wtf",
+    "https://singapore.mainnet.block-engine.jito.wtf",
+    "https://tokyo.mainnet.block-engine.jito.wtf",
+]
+uuid = "8c7cda54-ef6e-4792-8617-da0341f8d485"
+trading_keypair = "/root/c/wallet/wallet.json"
+tip_min_lamports = 1000
+tip_max_lamports = 1000000
+tip_profit_percent = 0.50
+# ریت لیمیت فقط سمت ما: 5 باندل در ثانیه برای کل loop
+# (هر باندل به ۸ endpoint می‌رود که هر کدام خودش 5/sec limit دارد)
+max_bundles_per_second = 5
+
+[rpc]
+url = "https://rpc.fra.shyft.to?api_key=farYqEW-7r1vxqok"
+
+[yellowstone_grpc]
+endpoint = "https://solana-yellowstone-grpc.publicnode.com:443"
+x_token = "cba491e2cd18e339c6517a51d4d497737cb04edd08d8915fc872c8a30cd5656a"
+
+[performance]
+# تعداد worker thread های tokio برای ربات. در سرور 16 هسته‌ای،
+# 3 هسته برای ربات و 13 هسته برای متیس توصیه می‌شود.
+threads = 4
+quote_timeout_ms = 200
+# CU limit بر اساس تعداد هاپ: [2 hops, 3 hops, 4 hops, 5 hops, 6 hops]
+cu_limits = [170000, 220000, 280000, 330000, 380000]
+# حداکثر درخواست‌های همزمان به Metis در هر chunk.
+# 256 تا = نصف بار قبلی (512) تا متیس پهنای باند کافی برای swap_instructions داشته باشد
+max_concurrent_quotes = 256
+candidate_batch_window_ms = 30
+candidate_top_per_route = 1
+candidate_global_top_n = 40
+max_concurrent_swap_instructions = 32
+swap_instructions_timeout_ms = 800
+metis_latency_margin_lamports = 5000
+# حداکثر کارگرهای همزمان مرحله محاسبات (merge + شلیک swap_instructions).
+# با fire-and-forget هر کارگر فقط چند میکروثانیه اسلات را نگه می‌دارد، پس
+# می‌توان این عدد را بالا برد تا گلوگاه بودن مرحله محاسبات قطعی رد شود.
+# اگر با عدد بالا jito_sent ثابت ماند ولی rate_lim زیاد شد ⇒ گلوگاه واقعی
+# rate limiter جیتوست، نه کارگرها.
+calc_workers = 64
+# حداکثر سن (ms) یک فرصت در صف انتظار ارسال به Jito.
+# اگر تا این مدت slot آزاد نشد → دور ریخته می‌شود (stale).
+# بیشتر = فرصت‌های قدیمی‌تر هم ارسال می‌شوند ولی احتمال landing کمتر است.
+queue_max_age_ms = 5000
+# اگر سرور 16 هسته دارد: متیس روی 0-11، ربات روی 12-15
+bot_cpu_cores = [12,13,14,15,28,29,30,31]
+
+[simulation]
+# LiteSVM pre-flight: قبل از ارسال هر باندل به Jito، همان tx را محلی روی
+# بایت‌کد واقعی DEXها اجرا می‌کنیم. اگر revert شد یا سود نداشت، ارسال لغو
+# می‌شود و base fee ذخیره می‌شود.
+#
+# منبع داده‌ی sim = همان gRPC شیفت که Metis هم می‌خواند (یک اتصال جدا،
+# هیچ سربار متقابلی با Metis ندارد).
+enabled = true
+so_dir = "/root/s/so"
+dex_dir = "/root/s/metis/1"
+workers = 8
+prefetch_pools_per_second = 5
+allow_hot_path_rpc_fetch = false
+enabled_dexes = [
+    "meteora_damm_v2",
+    "meteora_dlmm",
+    "Raydium_Concentrated_Liquidity",
+    "raydium_clmm",
+    "raydium_cpmm",
+    "whirlpool",
+    "pancakeswap",
+    "manifest",
+    "solfi",
+    "solfi_v2",
+    "tessera_v",
+    "goonfi_v2",
+    "invariant",
+    "1dex",
+    "alphaq",
+    "aquifer",
+    "byreal_clmm",
+    "bonkswap",
+    "fusion_amm",
+    "meteora_pools",
+    "mercurial_stable_swap",
+    "zerofi",
+]
+# fail_closed=true  (امن)  : اگر sim خطا داد ⇒ ارسال نکن
+# fail_closed=false (رول‌اوت) : اگر sim خطا داد ⇒ فقط log بزن و بفرست
+fail_closed = true
+
+[jito_grpc]
+# مسیر دوم ارسال باندل از طریق SearcherService gRPC جیتو با کیف whitelist.
+# کیف whitelist شده ⇒ rate limit جیتو = 5 req/s per region (8 ریجن × 5 = 40/sec).
+# لیمیت داخلی ربات (max_bundles_per_second) از این عدد بسیار پایین‌تر است،
+# پس هیچ‌وقت به سقف جیتو نمی‌خوریم.
+#
+# اگر auth یک ریجن fail کرد، همان ریجن به no-auth mode می‌رود (1 req/s)،
+# بقیه ریجن‌ها دست‌نخورده با 5/sec ادامه می‌دهند.
+#
+# مجموع throughput = jito.max_bundles_per_second + jito_grpc.max_bundles_per_second
+# (در تنظیمات فعلی: 5 + 5 = 10 باندل در ثانیه).
+#
+# تکراری ارسال نمی‌شود: dispatcher اول REST limiter را می‌چکد؛ اگر جا داشت
+# ⇒ REST، وگرنه gRPC limiter را امتحان می‌کند؛ اگر هر دو پر بودند ⇒ فرصت
+# drop می‌شود (jito_rate_limited++).
+enabled = true
+endpoints = [
+    "https://amsterdam.mainnet.block-engine.jito.wtf",
+    "https://dublin.mainnet.block-engine.jito.wtf",
+    "https://frankfurt.mainnet.block-engine.jito.wtf",
+    "https://london.mainnet.block-engine.jito.wtf",
+    "https://ny.mainnet.block-engine.jito.wtf",
+    "https://slc.mainnet.block-engine.jito.wtf",
+    "https://singapore.mainnet.block-engine.jito.wtf",
+    "https://tokyo.mainnet.block-engine.jito.wtf",
+]
+# این ولت توسط جیتو whitelist شده — هیچ دارایی‌ای نگه نمی‌دارد و هیچ
+# تراکنشی امضا نمی‌کند. فقط برای احراز هویت اتصال gRPC استفاده می‌شود.
+auth_keypair = "/root/c/wallet/grpc.json"
+max_bundles_per_second = 5
+
+[template_cache]
+# Tier-1: route_signature دقیق → patch amounts → بدون Metis call
+# Tier-2: hop-pair index (هر دو pool دیده شده) → patch amounts → بدون Metis call
+# Tier-3: fallback به /swap-instructions + ذخیره template برای دفعات بعد
+force_fresh_metis_all = true
+save_new = false
+serve_route = false
+serve_from_metis = true

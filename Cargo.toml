@@ -1,0 +1,84 @@
+[workspace]
+# Workspace root.  The LiteSVM source lives at vendor/litesvm (committed
+# directly to this repo for reference).  Cargo pulls litesvm via git dep
+# (see litesvm = { git = ... } below) — the path dep cannot be used here
+# because Cargo resolves 'workspace = true' from the patching workspace root,
+# not litesvm's own workspace root.
+resolver = "2"
+
+[package]
+name = "solana-arb-bot"
+version = "0.1.0"
+edition = "2021"
+# Ensures `cargo run` at the workspace root always starts the main bot binary
+# even though a second binary (alt_loader) also exists in this package.
+default-run = "solana-arb-bot"
+
+[profile.release]
+# Maximum runtime performance for the hot path. Compile time goes up
+# significantly (LTO + single codegen unit), but every microsecond saved
+# in tx build / ALT walk / Jito broadcast is worth it on a long-running
+# arbitrage bot.
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+strip = true
+
+[dependencies]
+# Solana
+solana-sdk = "2.2"
+solana-client = "2.2"
+solana-transaction-status = "2.2"
+spl-associated-token-account = "6"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+base64 = "0.22"
+bincode = "1"
+bs58 = "0.5"
+
+# Async / HTTP
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+
+# gRPC (Jito)
+tonic = { version = "0.12", features = ["tls", "tls-webpki-roots"] }
+prost = "0.13"
+prost-types = "0.13"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Misc
+futures = "0.3"
+rand = "0.8"
+anyhow = "1"
+thiserror = "1"
+core_affinity = "0.8"
+
+# Local SVM simulation (pre-flight filter before Jito send).
+# Git dep so Cargo resolves litesvm's own workspace dependencies correctly.
+# The vendored source at vendor/litesvm is a reference copy at the same commit.
+litesvm = { git = "https://github.com/LiteSVM/litesvm", branch = "master" }
+# solana-account must match litesvm's workspace pin (3.2.0) so the Account
+# type that crosses the Yellowstone cache → LiteSVM boundary is the same type.
+solana-account = "3.2.0"
+# litesvm 0.11 uses granular solana-* crates at major version 2-3.
+# Declared explicitly so litesvm_sim.rs can import the types needed for the
+# conversion adapters at the solana-sdk 2.x / litesvm 3.x type boundary.
+solana-address = "2"
+solana-clock = "3.0.1"
+solana-transaction = "3"
+dashmap = "6"
+
+# Yellowstone gRPC — live account-state stream (feeds sim cache, same source as Metis).
+# Version 6.1 aligns with solana-sdk ~2.2 used elsewhere in this crate.
+yellowstone-grpc-client = "6.1"
+yellowstone-grpc-proto = "6.1"
+
+[build-dependencies]
+tonic-build = "0.12"
