@@ -413,14 +413,14 @@ impl Simulator {
         route_programs: &str,
         lite_err: &str,
         ix_source: &str,
-    ) {
+    ) -> Option<SimOutcome> {
         let attempt = RPC_SNAPSHOT_RETRY_COUNT.fetch_add(1, Ordering::Relaxed);
         if attempt >= MAX_RPC_SNAPSHOT_RETRY_PER_PROCESS {
             eprintln!(
                 "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} route_labels={} programs={} failed_program={} status=skipped reason=process_cap lite_err={}",
                 route_sig, ix_source, route_labels, route_programs, failed_program, lite_err
             );
-            return;
+            return None;
         }
 
         let mut metas = account_metas.to_vec();
@@ -457,7 +457,7 @@ impl Simulator {
                     e,
                     lite_err
                 );
-                return;
+                return None;
             }
         };
 
@@ -559,7 +559,7 @@ impl Simulator {
                 slot_delta,
                 lite_err
             );
-            return;
+            return None;
         }
 
         let wsol_before = parse_wsol_amount(&svm, self.wsol_ata);
@@ -573,7 +573,7 @@ impl Simulator {
                     "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} route_labels={} programs={} failed_program={} status=tx_convert_error error={} lite_err={}",
                     route_sig, ix_source, route_labels, route_programs, failed_program, e, lite_err
                 );
-                return;
+                return None;
             }
         };
 
@@ -590,10 +590,10 @@ impl Simulator {
                     .and_then(|(_, acc)| parse_token_amount(acc.data()))
                     .unwrap_or(wsol_before);
                 let min_wsol_after = wsol_before.saturating_add(min_wsol_gain);
-                let result_kind = if wsol_after >= min_wsol_after {
-                    "pass_profitable"
+                let (result_kind, profitable) = if wsol_after >= min_wsol_after {
+                    ("pass_profitable", true)
                 } else {
-                    "pass_unprofitable"
+                    ("pass_unprofitable", false)
                 };
                 eprintln!(
                     "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} route_labels={} programs={} failed_program={} status=ok result={} injected={} cache_slot={} rpc_context_slot={} slot_delta={} compute_units={} wsol_before={} wsol_after={} min_after={} diagnosis=stale_cache_possible lite_err={}",
@@ -613,6 +613,14 @@ impl Simulator {
                     min_wsol_after,
                     lite_err
                 );
+                if profitable {
+                    return Some(SimOutcome {
+                        compute_units: info.meta.compute_units_consumed,
+                        wsol_before,
+                        wsol_after,
+                    });
+                }
+                None
             }
             Err(meta) => {
                 metrics
@@ -634,6 +642,7 @@ impl Simulator {
                     meta.meta.compute_units_consumed,
                     lite_err
                 );
+                None
             }
         }
     }
@@ -1150,6 +1159,28 @@ impl Simulator {
                         );
                         debugged_failed_program = true;
                         compared_alphaq_invalid_owner = true;
+                        // Retry with fresh RPC snapshot: if local cache had a stale/wrong-owner
+                        // account, the snapshot will correct it. If the retry passes and the
+                        // route is profitable, return it so the bundle can be submitted.
+                        if let Some(outcome) = self.retry_with_rpc_snapshot(
+                            &program,
+                            cache,
+                            tx,
+                            alts,
+                            &account_metas,
+                            &synthetic_readonly_system_accounts,
+                            &created_by_setup,
+                            min_wsol_gain,
+                            metrics,
+                            route_sig,
+                            route_labels,
+                            route_programs,
+                            &lite_err,
+                            ix_source,
+                        ) {
+                            metrics.sim_alphaq_owner_rpc_retry_ok.fetch_add(1, Ordering::Relaxed);
+                            return Ok(outcome);
+                        }
                     } else {
                         compare_revert_with_rpc(
                             cache,
@@ -1266,7 +1297,7 @@ impl Simulator {
                             metrics,
                         );
                         if should_retry_with_rpc_snapshot(&program, &lite_err, &meta.meta.logs) {
-                            self.retry_with_rpc_snapshot(
+                            if let Some(outcome) = self.retry_with_rpc_snapshot(
                                 &program,
                                 cache,
                                 tx,
@@ -1281,7 +1312,9 @@ impl Simulator {
                                 route_programs,
                                 &lite_err,
                                 ix_source,
-                            );
+                            ) {
+                                return Ok(outcome);
+                            }
                         }
                     }
                 }

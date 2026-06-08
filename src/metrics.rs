@@ -90,6 +90,8 @@ pub struct Metrics {
     pub dropped_unverified_mix_route: AtomicU64,
     /// AlphaQ failed in LiteSVM with InvalidAccountOwner.
     pub sim_alphaq_invalid_owner: AtomicU64,
+    /// AlphaQ InvalidAccountOwner resolved by RPC snapshot retry (stale cache fixed).
+    pub sim_alphaq_owner_rpc_retry_ok: AtomicU64,
     /// RPC simulateTransaction succeeded for a tx that LiteSVM rejected.
     pub sim_rpc_compare_ok: AtomicU64,
     /// RPC simulateTransaction rejected with an error too.
@@ -163,6 +165,7 @@ impl Metrics {
             dropped_invalid_mix_route: AtomicU64::new(0),
             dropped_unverified_mix_route: AtomicU64::new(0),
             sim_alphaq_invalid_owner: AtomicU64::new(0),
+            sim_alphaq_owner_rpc_retry_ok: AtomicU64::new(0),
             sim_rpc_compare_ok: AtomicU64::new(0),
             sim_rpc_compare_same_fail: AtomicU64::new(0),
             sim_rpc_compare_error: AtomicU64::new(0),
@@ -239,6 +242,7 @@ impl Metrics {
                 let mix_drop_invalid     = m.dropped_invalid_mix_route.swap(0, Ordering::Relaxed);
                 let mix_drop_unverified  = m.dropped_unverified_mix_route.swap(0, Ordering::Relaxed);
                 let sim_alphaq_owner = m.sim_alphaq_invalid_owner.swap(0, Ordering::Relaxed);
+                let sim_alphaq_owner_retry_ok = m.sim_alphaq_owner_rpc_retry_ok.swap(0, Ordering::Relaxed);
                 let rpc_cmp_ok       = m.sim_rpc_compare_ok.swap(0, Ordering::Relaxed);
                 let rpc_cmp_fail     = m.sim_rpc_compare_same_fail.swap(0, Ordering::Relaxed);
                 let rpc_cmp_err      = m.sim_rpc_compare_error.swap(0, Ordering::Relaxed);
@@ -283,7 +287,7 @@ PRE-QUEUE : swap_ix_ok={sw_ok}  swap_ix_fail={swap_fail} [timeout={sf_to} http={
   IN-QUEUE  : stale={stale} (waited >{ttl_secs}s)\n  \
   TX-BUILD  : build_fail={build}  too_large={too_big}  too_many_locks={too_locks}  calc_ok={calc}\n  \
   MIX       : invalid_accounts={mix_invalid_accounts}  invalid_pools={mix_invalid_pools}  drop_invalid_route={mix_drop_invalid}  drop_unverified_route={mix_drop_unverified}  data_hash_only_drop={mix_data_hash_only_drop}\n  \
-  SIM       : required={sim_req}  bypassed={sim_byp}  ok={sim_ok}  fail={sim_fail}  missing_account={sim_miss}  alphaq_invalid_owner={sim_alphaq_owner}\n  \
+  SIM       : required={sim_req}  bypassed={sim_byp}  ok={sim_ok}  fail={sim_fail}  missing_account={sim_miss}  alphaq_invalid_owner={sim_alphaq_owner}  alphaq_owner_rpc_retry_ok={sim_alphaq_owner_retry_ok}\n  \
   SIM-CMP   : rpc_ok={rpc_cmp_ok}  rpc_same_fail={rpc_cmp_fail}  rpc_compare_error={rpc_cmp_err}  state_mismatch={state_mismatch_total} [writable={state_mismatch_writable} readonly={state_mismatch_readonly}]  retry_rpc_snapshot_ok={retry_rpc_snapshot_ok}  retry_rpc_snapshot_fail={retry_rpc_snapshot_fail}\n  \
   JITO      : sent={jito}  send_fail={jfail}  waited_for_slot={requeued}\n  \
 SWAP-IX   : avg_metis={avg_ms}ms"
