@@ -2,6 +2,7 @@
 mod account_cache;
 mod alt_cache;
 mod arbitrage;
+mod auto_missing_accounts;
 mod blockhash_cache;
 mod config;
 mod dex_accounts;
@@ -157,6 +158,7 @@ async fn async_main(config: config::Config) -> Result<()> {
         let tx_static_account_cache_path = manual_accounts_root.join("tx_static_account_cache.json");
 
         manual_sim_accounts::load_cached_accounts_into_cache(&manual_account_cache_path, &cache)?;
+        auto_missing_accounts::load_cache_into_account_cache(&manual_accounts_root, &cache);
         cache.load_tx_static_account_cache(&tx_static_account_cache_path)?;
         let tx_static_refresh_accounts =
             cache.tx_static_refresh_pubkeys(&tx_static_account_cache_path)?;
@@ -169,6 +171,12 @@ async fn async_main(config: config::Config) -> Result<()> {
             config.simulation.prefetch_pools_per_second,
         )
         .await?;
+
+        let missing_handle = Arc::new(auto_missing_accounts::start(
+            &manual_accounts_root,
+            rpc_client.clone(),
+            cache.clone(),
+        ));
 
         eprintln!("[rpc_fetch_reason] reason=block_time count=1 pubkeys_sample=[]");
         if let Ok(s) = rpc_client.get_slot() {
@@ -313,6 +321,7 @@ async fn async_main(config: config::Config) -> Result<()> {
             manual_accounts_root.clone(),
             cache.stream_slot(),
             cache.stream_unix_timestamp(),
+            Some(missing_handle),
         )?;
         eprintln!(
             "[simulator_ready] true workers={} so_dir={}",

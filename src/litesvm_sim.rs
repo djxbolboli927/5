@@ -95,6 +95,7 @@ pub struct Simulator {
     current_unix_timestamp: Arc<AtomicI64>,
     allow_hot_path_rpc_fetch: bool,
     manual_accounts_root: PathBuf,
+    missing_handle: Option<Arc<crate::auto_missing_accounts::AutoMissingAccountsHandle>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -201,6 +202,7 @@ impl Simulator {
         manual_accounts_root: PathBuf,
         current_slot: Arc<AtomicU64>,
         current_unix_timestamp: Arc<AtomicI64>,
+        missing_handle: Option<Arc<crate::auto_missing_accounts::AutoMissingAccountsHandle>>,
     ) -> Result<Self> {
         // Build the SVM with the full mainnet feature set.
         //
@@ -303,6 +305,7 @@ impl Simulator {
             current_unix_timestamp,
             allow_hot_path_rpc_fetch,
             manual_accounts_root,
+            missing_handle,
         })
     }
 
@@ -814,6 +817,18 @@ impl Simulator {
                             reason: "hot_path_rpc_disabled_no_synthetic".to_string(),
                         },
                     );
+                    if let Some(handle) = &self.missing_handle {
+                        handle.record(crate::auto_missing_accounts::MissingAccountEvent {
+                            pubkey: *pk,
+                            route_sig,
+                            route_labels: route_labels.to_string(),
+                            programs: route_programs.to_string(),
+                            source: meta.source.as_str().to_string(),
+                            is_signer: meta.is_signer,
+                            is_writable: meta.is_writable,
+                            created_by_setup: created_by_setup.contains(pk),
+                        });
+                    }
                     if meta.is_writable {
                         log_missing_writable(meta, "hot_path_rpc_disabled");
                     }
@@ -2773,6 +2788,7 @@ impl SimulatorPool {
         manual_accounts_root: PathBuf,
         current_slot: Arc<AtomicU64>,
         current_unix_timestamp: Arc<AtomicI64>,
+        missing_handle: Option<Arc<crate::auto_missing_accounts::AutoMissingAccountsHandle>>,
     ) -> Result<Self> {
         let workers = workers.max(1);
         let mut sims = Vec::with_capacity(workers);
@@ -2786,6 +2802,7 @@ impl SimulatorPool {
                 manual_accounts_root.clone(),
                 current_slot.clone(),
                 current_unix_timestamp.clone(),
+                missing_handle.clone(),
             )
             .with_context(|| format!("failed to build sim worker #{i}"))?;
             sims.push(Arc::new(sim));
