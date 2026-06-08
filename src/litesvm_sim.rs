@@ -221,7 +221,8 @@ impl Simulator {
             .with_sigverify(false)
             .with_blockhash_check(false)
             .with_default_programs()
-            .with_mainnet_features();
+            .with_mainnet_features()
+            .with_feature_accounts();
 
         // warp_to_slot atomically advances Clock.slot, Clock.epoch,
         // SlotHashes, and EpochSchedule — everything PMM oracle staleness
@@ -376,7 +377,8 @@ impl Simulator {
             .with_sigverify(false)
             .with_blockhash_check(false)
             .with_default_programs()
-            .with_mainnet_features();
+            .with_mainnet_features()
+            .with_feature_accounts();
         svm.warp_to_slot(slot);
         set_live_clock(&mut svm, slot, unix_timestamp);
 

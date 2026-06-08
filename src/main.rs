@@ -116,7 +116,7 @@ async fn async_main(config: config::Config) -> Result<()> {
 
     let metis = Arc::new(metis::MetisClient::new(
         &config.metis.url,
-        config.performance.quote_timeout_ms,
+        config.performance.quote_timeout_ms.max(config.performance.swap_instructions_timeout_ms),
     ));
 
     let jito_client = Arc::new(jito::JitoClient::new(&config.jito.urls, &config.jito.uuid));
