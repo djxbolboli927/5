@@ -22,6 +22,12 @@ use crate::account_cache::AccountCache;
 
 const PENDING_SCHEMA_VERSION: u32 = 1;
 const CACHE_SCHEMA_VERSION: u32 = 1;
+const HARD_MISSING_SCHEMA_VERSION: u32 = 1;
+
+/// After this many RPC "not found" responses for a single account, the account
+/// is added to the persistent hard-missing list for manual review.
+/// The bot continues retrying even after this threshold is crossed.
+const HARD_MISSING_THRESHOLD: u32 = 8000;
 
 const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
@@ -139,6 +145,27 @@ struct LiveRecord {
     first_seen_unix: u64,
 }
 
+/// Account that RPC consistently returns as non-existent after
+/// HARD_MISSING_THRESHOLD attempts. Written to `missing_accounts_8000.json`
+/// for manual review. The file only grows; entries are never deleted.
+#[derive(Clone, Serialize, Deserialize)]
+struct HardMissingRecord {
+    pubkey: String,
+    retry_count: u32,
+    route_labels: serde_json::Value,
+    programs: serde_json::Value,
+    is_writable: bool,
+    source: String,
+    first_recorded_unix: u64,
+    last_recorded_unix: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HardMissingFile {
+    schema_version: u32,
+    accounts: Vec<HardMissingRecord>,
+}
+
 // ── Service ───────────────────────────────────────────────────────────────────
 
 struct AutoMissingAccountsService {
@@ -146,6 +173,7 @@ struct AutoMissingAccountsService {
     cache_path: PathBuf,
     errors_path: PathBuf,
     live_path: PathBuf,
+    hard_missing_path: PathBuf,
     rpc: Arc<RpcClient>,
     account_cache: AccountCache,
     receiver: mpsc::Receiver<MissingAccountEvent>,
@@ -163,6 +191,7 @@ pub fn start(
         cache_path: manual_accounts_root.join("missing_sim_account_cache.json"),
         errors_path: manual_accounts_root.join("missing_sim_account_errors.json"),
         live_path: manual_accounts_root.join("missing_sim_account_live.json"),
+        hard_missing_path: manual_accounts_root.join("missing_accounts_8000.json"),
         rpc,
         account_cache,
         receiver,
@@ -278,12 +307,19 @@ impl AutoMissingAccountsService {
         let cache_path = self.cache_path.clone();
         let errors_path = self.errors_path.clone();
         let live_path = self.live_path.clone();
+        let hard_missing_path = self.hard_missing_path.clone();
         let rpc = self.rpc.clone();
         let account_cache = self.account_cache.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            if let Err(e) =
-                fetch_pending(&pending_path, &cache_path, &errors_path, &live_path, &rpc, &account_cache)
-            {
+            if let Err(e) = fetch_pending(
+                &pending_path,
+                &cache_path,
+                &errors_path,
+                &live_path,
+                &hard_missing_path,
+                &rpc,
+                &account_cache,
+            ) {
                 eprintln!("[missing_account_fetch] error={}", e);
             }
         })
@@ -340,16 +376,17 @@ fn fetch_pending(
     cache_path: &Path,
     errors_path: &Path,
     live_path: &Path,
+    hard_missing_path: &Path,
     rpc: &RpcClient,
     account_cache: &AccountCache,
 ) -> Result<()> {
     let mut pending = read_pending(pending_path)?;
+    // Retry every pending account regardless of retry_count — the bot keeps
+    // trying until the account appears on-chain or the user stops the bot.
     let to_fetch: Vec<usize> = pending
         .iter()
         .enumerate()
-        .filter(|(_, r)| {
-            r.status == "pending_rpc_fetch" || (r.status == "failed" && r.retry_count < 5)
-        })
+        .filter(|(_, r)| r.status == "pending_rpc_fetch" || r.status == "failed")
         .map(|(i, _)| i)
         .collect();
 
@@ -360,6 +397,7 @@ fn fetch_pending(
     let mut cached = read_cache(cache_path)?;
     let mut errors = read_errors(errors_path)?;
     let mut live = read_live(live_path)?;
+    let mut hard_missing = read_hard_missing(hard_missing_path)?;
     let now = unix_now();
 
     // Process in chunks of 100
@@ -456,15 +494,38 @@ fn fetch_pending(
                         }
                         None => {
                             pending[idx].retry_count += 1;
+                            pending[idx].status = "failed".to_string();
                             pending[idx].last_error = Some("rpc_null".to_string());
-                            if pending[idx].retry_count >= 5 {
-                                pending[idx].status = "failed".to_string();
+                            upsert_error(&mut errors, &pk_str, "rpc_null", now);
+
+                            eprintln!(
+                                "[missing_account_rpc_null] pubkey={} retry_count={} action=will_retry_next_cycle",
+                                pk_str, pending[idx].retry_count
+                            );
+
+                            // After HARD_MISSING_THRESHOLD failures, record to
+                            // the persistent 8000 list for manual review.
+                            // The bot continues retrying even after this.
+                            if pending[idx].retry_count >= HARD_MISSING_THRESHOLD {
+                                upsert_hard_missing(
+                                    &mut hard_missing,
+                                    &pk_str,
+                                    pending[idx].retry_count,
+                                    &pending[idx].route_labels,
+                                    &pending[idx].programs,
+                                    pending[idx].is_writable,
+                                    &pending[idx].source,
+                                    now,
+                                );
                                 eprintln!(
-                                    "[missing_account_rpc_null] pubkey={} retry_count={} action=check_rpc_or_account_deleted",
-                                    pk_str, pending[idx].retry_count
+                                    "[missing_account_8000] pubkey={} retry_count={} is_writable={} route_labels={} programs={} action=saved_to_hard_missing_list",
+                                    pk_str,
+                                    pending[idx].retry_count,
+                                    pending[idx].is_writable,
+                                    pending[idx].route_labels,
+                                    pending[idx].programs,
                                 );
                             }
-                            upsert_error(&mut errors, &pk_str, "rpc_null", now);
                         }
                     }
                 }
@@ -481,7 +542,8 @@ fn fetch_pending(
         }
     }
 
-    // Warn about accounts that are cached but still appearing as missing
+    // Warn about accounts that are cached but still appearing as missing —
+    // these are stale-data issues rather than "account doesn't exist" issues.
     for r in &pending {
         if r.status == "cached" && r.seen_count > 10 {
             eprintln!(
@@ -491,10 +553,18 @@ fn fetch_pending(
         }
     }
 
+    eprintln!(
+        "[missing_account_fetch] pending_total={} to_fetch={} hard_missing_total={}",
+        pending.len(),
+        to_fetch.len(),
+        hard_missing.len(),
+    );
+
     write_pending(pending_path, &pending)?;
     write_cache(cache_path, &cached)?;
     write_errors(errors_path, &errors)?;
     write_live(live_path, &live)?;
+    write_hard_missing(hard_missing_path, &hard_missing)?;
     Ok(())
 }
 
@@ -607,6 +677,63 @@ fn write_live(path: &Path, records: &[LiveRecord]) -> Result<()> {
         std::fs::create_dir_all(p)?;
     }
     Ok(std::fs::write(path, serde_json::to_vec_pretty(records)?)?)
+}
+
+fn read_hard_missing(path: &Path) -> Result<Vec<HardMissingRecord>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let s = std::fs::read_to_string(path)?;
+    let f: HardMissingFile = serde_json::from_str(&s).unwrap_or(HardMissingFile {
+        schema_version: HARD_MISSING_SCHEMA_VERSION,
+        accounts: Vec::new(),
+    });
+    if f.schema_version != HARD_MISSING_SCHEMA_VERSION {
+        return Ok(Vec::new());
+    }
+    Ok(f.accounts)
+}
+
+fn write_hard_missing(path: &Path, records: &[HardMissingRecord]) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    if let Some(p) = path.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    let f = HardMissingFile {
+        schema_version: HARD_MISSING_SCHEMA_VERSION,
+        accounts: records.to_vec(),
+    };
+    Ok(std::fs::write(path, serde_json::to_vec_pretty(&f)?)?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_hard_missing(
+    records: &mut Vec<HardMissingRecord>,
+    pubkey: &str,
+    retry_count: u32,
+    route_labels: &serde_json::Value,
+    programs: &serde_json::Value,
+    is_writable: bool,
+    source: &str,
+    now: u64,
+) {
+    if let Some(r) = records.iter_mut().find(|r| r.pubkey == pubkey) {
+        r.retry_count = retry_count;
+        r.last_recorded_unix = now;
+    } else {
+        records.push(HardMissingRecord {
+            pubkey: pubkey.to_string(),
+            retry_count,
+            route_labels: route_labels.clone(),
+            programs: programs.clone(),
+            is_writable,
+            source: source.to_string(),
+            first_recorded_unix: now,
+            last_recorded_unix: now,
+        });
+    }
 }
 
 fn upsert_error(records: &mut Vec<ErrorRecord>, pubkey: &str, error: &str, now: u64) {

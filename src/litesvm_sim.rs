@@ -511,6 +511,12 @@ impl Simulator {
                     if account.executable() {
                         continue;
                     }
+                    // Immediately update the live AccountCache so the next
+                    // simulation of this route finds fresh state without
+                    // another RPC round-trip. For writable pool-state accounts
+                    // owned by a registered DEX program, Yellowstone's owner
+                    // filter will keep the entry live going forward.
+                    cache.insert_manual(*pk, account.clone());
                     if let Err(e) = svm.set_account(pk_to_addr(*pk), account.clone()) {
                         eprintln!(
                             "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} failed_program={} status=account_inject_error pubkey={} error={:?}",
@@ -532,6 +538,22 @@ impl Simulator {
                         }
                     } else if !created_by_setup.contains(pk) {
                         missing += 1;
+                        // Queue to background fetcher — it will keep retrying
+                        // until the account appears or crosses the 8000 threshold.
+                        if let Some(handle) = &self.missing_handle {
+                            handle.record(
+                                crate::auto_missing_accounts::MissingAccountEvent {
+                                    pubkey: *pk,
+                                    route_sig,
+                                    route_labels: route_labels.to_string(),
+                                    programs: route_programs.to_string(),
+                                    source: "rpc_retry_not_found".to_string(),
+                                    is_signer: meta.is_signer,
+                                    is_writable: meta.is_writable,
+                                    created_by_setup: false,
+                                },
+                            );
+                        }
                     }
                 }
                 Some(AccountFetchResult::Error { .. }) => {
