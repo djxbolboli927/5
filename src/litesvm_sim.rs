@@ -88,6 +88,10 @@ pub struct Simulator {
     payer_pubkey: Pubkey,
     loaded_programs: HashSet<Pubkey>,
     loaded_program_files: HashMap<Pubkey, String>,
+    /// Program bytecode kept in memory so the RPC-snapshot retry path can build
+    /// a fresh LiteSVM without re-reading ~28 .so files from disk on every
+    /// failed simulation (the retry runs per failure now that the cap is gone).
+    loaded_program_bytes: HashMap<Pubkey, Vec<u8>>,
     jito_tip_accounts: HashSet<Pubkey>,
     fail_closed: bool,
     /// Live mainnet slot from the Yellowstone gRPC stream (zero RPC).
@@ -252,6 +256,7 @@ impl Simulator {
         let mut missing = 0usize;
         let mut loaded_programs = HashSet::new();
         let mut loaded_program_files = HashMap::new();
+        let mut loaded_program_bytes = HashMap::new();
         for (pid_str, fname) in crate::program_registry::PROGRAMS {
             if fname.is_empty() {
                 continue;
@@ -268,7 +273,19 @@ impl Simulator {
             let path = path.unwrap();
             let pid = Pubkey::try_from(*pid_str)
                 .map_err(|e| anyhow!("bad program id {pid_str}: {e:?}"))?;
-            match svm.add_program_from_file(pk_to_addr(pid), &path) {
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[sim_program_load] program={pid} registry_file={fname} resolved={} exists=true loaded=false error=read:{e:?}",
+                        path.display()
+                    );
+                    warn!(program = %pid, path = %path.display(), error = ?e, "program read failed");
+                    missing += 1;
+                    continue;
+                }
+            };
+            match svm.add_program(pk_to_addr(pid), &bytes) {
                 Ok(()) => {
                     eprintln!(
                         "[sim_program_load] program={pid} registry_file={fname} resolved={} exists=true loaded=true",
@@ -277,6 +294,7 @@ impl Simulator {
                     debug!(program = %pid, path = %path.display(), "program loaded");
                     loaded_programs.insert(pid);
                     loaded_program_files.insert(pid, path.display().to_string());
+                    loaded_program_bytes.insert(pid, bytes);
                     loaded += 1;
                 }
                 Err(e) => {
@@ -297,6 +315,7 @@ impl Simulator {
             payer_pubkey,
             loaded_programs,
             loaded_program_files,
+            loaded_program_bytes,
             jito_tip_accounts: crate::transaction::jito_tip_pubkeys()
                 .into_iter()
                 .collect(),
@@ -385,13 +404,13 @@ impl Simulator {
         svm.warp_to_slot(slot);
         set_live_clock(&mut svm, slot, unix_timestamp);
 
-        let mut programs = self.loaded_program_files.iter().collect::<Vec<_>>();
+        // Reuse the in-memory bytecode captured at startup — no disk I/O on the
+        // retry hot path.
+        let mut programs = self.loaded_program_bytes.iter().collect::<Vec<_>>();
         programs.sort_by_key(|(program, _)| program.to_string());
-        for (program, path) in programs {
-            svm.add_program_from_file(pk_to_addr(*program), Path::new(path.as_str()))
-                .with_context(|| {
-                    format!("snapshot add_program_from_file program={program} path={path}")
-                })?;
+        for (program, bytes) in programs {
+            svm.add_program(pk_to_addr(*program), bytes)
+                .with_context(|| format!("snapshot add_program program={program}"))?;
         }
         Ok(svm)
     }

@@ -45,6 +45,18 @@ const SIM_STATIC_EXTRA_ACCOUNTS: &[&str] = &[
     "GswwnegnBMWEuEsptDCBDmRB9YtG5zjetTSw7RunUQMY",
 ];
 
+/// Parse a config commitment string into a `CommitmentConfig`. Defaults to
+/// `processed` for anything unrecognised so the RPC stays aligned with the
+/// Yellowstone stream.
+fn parse_commitment(level: &str) -> solana_sdk::commitment_config::CommitmentConfig {
+    use solana_sdk::commitment_config::CommitmentConfig;
+    match level.trim().to_ascii_lowercase().as_str() {
+        "finalized" => CommitmentConfig::finalized(),
+        "confirmed" => CommitmentConfig::confirmed(),
+        _ => CommitmentConfig::processed(),
+    }
+}
+
 fn main() -> Result<()> {
     let log_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "error".to_string());
     tracing_subscriber::fmt()
@@ -87,7 +99,20 @@ async fn async_main(config: config::Config) -> Result<()> {
 
     let trading_keypair = Arc::new(wallet::read_keypair(&config.jito.trading_keypair)?);
 
-    let rpc_client = Arc::new(RpcClient::new(config.rpc.url.clone()));
+    // Match the RPC commitment to the Yellowstone stream commitment
+    // (processed) so account fetches, sim-compare, and retry snapshots read
+    // the same slot the cache is fed from. Reading finalized state (the
+    // RpcClient::new default) makes every hot pool look stale and feeds the
+    // retry path data OLDER than the cache it is trying to correct.
+    let rpc_commitment = parse_commitment(&config.rpc.commitment);
+    eprintln!(
+        "[rpc_commitment] level={} (stream is processed; keep these aligned)",
+        config.rpc.commitment
+    );
+    let rpc_client = Arc::new(RpcClient::new_with_commitment(
+        config.rpc.url.clone(),
+        rpc_commitment,
+    ));
 
     let wsol_mint = solana_sdk::pubkey::Pubkey::from_str_const(tokens::WSOL_MINT);
     let wsol_ata = spl_associated_token_account::get_associated_token_address(

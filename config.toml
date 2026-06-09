@@ -40,6 +40,10 @@ max_bundles_per_second = 5
 
 [rpc]
 url = "https://rpc.fra.shyft.to?api_key=farYqEW-7r1vxqok"
+# Commitment for all RPC reads. Keep this aligned with the Yellowstone stream
+# (which is "processed"). Using "finalized" makes every actively-traded pool
+# look stale (~30+ slot lag) and feeds the retry path data older than the cache.
+commitment = "processed"
 
 [yellowstone_grpc]
 endpoint = "https://solana-yellowstone-grpc.publicnode.com:443"
