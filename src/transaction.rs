@@ -93,12 +93,31 @@ pub fn build_arb_transaction(
     let mut instructions: Vec<Instruction> = Vec::new();
 
     // #1 -- SetComputeUnitLimit
+    //
+    // `cu_limit` from the config table budgets the *swap* (route_v2) only. The
+    // transaction also runs ATA CreateIdempotent setup instructions (and an
+    // optional cleanup) that each burn ~9k CU before the swap starts. Without
+    // explicit headroom these eat into the swap budget and the final hop dies
+    // with ComputationalBudgetExceeded — even though the route is profitable
+    // and would land on-chain with a larger limit.
+    //
+    // There is no SetComputeUnitPrice instruction in this tx, so a higher CU
+    // limit costs nothing (no priority fee; the Jito tip is fixed separately).
+    // We therefore add generous per-instruction headroom and cap at Solana's
+    // per-transaction maximum.
+    const SETUP_IX_CU_BUDGET: u32 = 15_000;
+    const MAX_TX_CU_LIMIT: u32 = 1_400_000;
+    let aux_ix_count = swap_ixs.setup_instructions.len() as u32
+        + u32::from(swap_ixs.cleanup_instruction.is_some());
+    let effective_cu_limit = cu_limit
+        .saturating_add(aux_ix_count.saturating_mul(SETUP_IX_CU_BUDGET))
+        .min(MAX_TX_CU_LIMIT);
     let cu_limit_ix = Instruction {
         program_id: Pubkey::from_str("ComputeBudget111111111111111111111111111111")?,
         accounts: vec![],
         data: {
             let mut data = vec![0x02];
-            data.extend_from_slice(&cu_limit.to_le_bytes());
+            data.extend_from_slice(&effective_cu_limit.to_le_bytes());
             data
         },
     };
