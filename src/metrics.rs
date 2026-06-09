@@ -1,8 +1,19 @@
+use solana_sdk::pubkey::Pubkey;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const WINDOW_SECS: u64 = 30;
+
+/// Per-DEX simulation outcome counters for one reporting window.
+/// `appeared` = sims whose route touched this program; `culprit_fail` = sims
+/// where this program was the one that reverted.
+#[derive(Default, Clone, Copy)]
+pub struct DexSimCounts {
+    pub appeared: u64,
+    pub culprit_fail: u64,
+}
 
 pub struct Metrics {
     // ── Stage 1: quoting ─────────────────────────────────────────────────────
@@ -124,6 +135,12 @@ pub struct Metrics {
     // ── swap_instructions latency ─────────────────────────────────────────────
     pub metis_fetch_ms_total: AtomicU64,
     pub metis_fetch_samples: AtomicU64,
+
+    // ── Per-DEX simulation outcomes (drained each reporting window) ────────────
+    /// Maps DEX program id → (appeared, culprit_fail) for the current window.
+    /// Lets the reporter show exactly which exchanges are simulated and which
+    /// one is responsible when a route reverts.
+    pub dex_sim_stats: Mutex<HashMap<Pubkey, DexSimCounts>>,
 }
 
 impl Metrics {
@@ -187,7 +204,21 @@ impl Metrics {
             dropped_merge_fail: AtomicU64::new(0),
             dropped_no_serve: AtomicU64::new(0),
             dropped_same_pool: AtomicU64::new(0),
+            dex_sim_stats: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Record the outcome of one simulation: every DEX program present in the
+    /// route gets `appeared += 1`; if the sim reverted, the culprit program
+    /// gets `culprit_fail += 1`. Cheap (one short-lived lock per sim).
+    pub fn record_dex_sim(&self, programs: &[Pubkey], failed_program: Option<Pubkey>) {
+        let mut map = self.dex_sim_stats.lock().unwrap();
+        for p in programs {
+            map.entry(*p).or_default().appeared += 1;
+        }
+        if let Some(f) = failed_program {
+            map.entry(f).or_default().culprit_fail += 1;
+        }
     }
 
     pub fn spawn_reporter(
@@ -276,6 +307,32 @@ impl Metrics {
 
                 let ram_pct = if sw_ok > 0 { from_ram * 100 / sw_ok } else { 0 };
 
+                // Drain per-DEX simulation outcomes for this window and format
+                // them sorted by appearance count (most-routed DEX first).
+                let dex_stats: Vec<(Pubkey, DexSimCounts)> = {
+                    let mut map = m.dex_sim_stats.lock().unwrap();
+                    let drained = std::mem::take(&mut *map);
+                    let mut v: Vec<_> = drained.into_iter().collect();
+                    v.sort_by(|a, b| b.1.appeared.cmp(&a.1.appeared));
+                    v
+                };
+                let dex_sim_line = if dex_stats.is_empty() {
+                    "(none simulated this window)".to_string()
+                } else {
+                    dex_stats
+                        .iter()
+                        .map(|(pk, c)| {
+                            format!(
+                                "{}[seen={} fail={}]",
+                                crate::program_registry::short_name(pk),
+                                c.appeared,
+                                c.culprit_fail
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("  ")
+                };
+
                 eprintln!(
                     "[{WINDOW_SECS}s] \
 metis_sent={sent} routes={routes} quoted_profitable={profit}\n  \
@@ -290,6 +347,7 @@ PRE-QUEUE : swap_ix_ok={sw_ok}  swap_ix_fail={swap_fail} [timeout={sf_to} http={
   SIM       : required={sim_req}  bypassed={sim_byp}  ok={sim_ok}  fail={sim_fail}  missing_account={sim_miss}  alphaq_invalid_owner={sim_alphaq_owner}  alphaq_owner_rpc_retry_ok={sim_alphaq_owner_retry_ok}\n  \
   SIM-CMP   : rpc_ok={rpc_cmp_ok}  rpc_same_fail={rpc_cmp_fail}  rpc_compare_error={rpc_cmp_err}  state_mismatch={state_mismatch_total} [writable={state_mismatch_writable} readonly={state_mismatch_readonly}]  retry_rpc_snapshot_ok={retry_rpc_snapshot_ok}  retry_rpc_snapshot_fail={retry_rpc_snapshot_fail}\n  \
   JITO      : sent={jito}  send_fail={jfail}  waited_for_slot={requeued}\n  \
+  DEX-SIM   : {dex_sim_line}\n  \
 SWAP-IX   : avg_metis={avg_ms}ms"
                 );
                 if sim_req > 0 && sim_ok == 0 && sim_fail > 0 {

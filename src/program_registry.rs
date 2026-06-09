@@ -9,6 +9,8 @@
 //!
 //! Nothing is blocked. Every DEX registered here is eligible for arbitrage.
 
+use solana_sdk::pubkey::Pubkey;
+
 pub const PROGRAMS: &[(&str, &str)] = &[
     // Aggregator (top-level program the swap_instruction targets).
     // Metis is a Jupiter fork: its swap_instruction carries Jupiter v6's
@@ -159,10 +161,22 @@ pub fn dex_key_from_label(label: &str) -> Option<&'static str> {
 /// Program ids the bot refuses to route through. Currently empty; every DEX in
 /// `PROGRAMS` is allowed.
 pub const FORBIDDEN_DEX_PROGRAM_IDS: &[&str] = &[];
-
 /// Jupiter/Metis DEX label substrings we ask the server to exclude up-front.
 /// Currently empty; every DEX label is allowed.
 pub const FORBIDDEN_DEX_LABELS: &[&str] = &[];
+
+/// Short, human-readable name for a DEX program id (used in per-DEX
+/// simulation-outcome stats). Falls back to a truncated pubkey when the id is
+/// not in the registry.
+pub fn short_name(program_id: &Pubkey) -> String {
+    let id = program_id.to_string();
+    for (pid, fname) in PROGRAMS {
+        if *pid == id {
+            return fname.trim_end_matches(".so").to_string();
+        }
+    }
+    format!("{}…", &id[..id.len().min(6)])
+}
 
 /// Program ids that the simulator should subscribe to on Yellowstone gRPC so
 /// their pool accounts end up in the hot cache. This is the superset of

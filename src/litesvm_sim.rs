@@ -1201,12 +1201,18 @@ impl Simulator {
         // Convert solana-sdk 2.x VersionedTransaction → solana-transaction 3.x.
         let litesvm_tx = to_litesvm_tx(tx)?;
 
+        // DEX programs touched by this route — attributed to per-DEX sim stats.
+        let dex_programs = dex_programs_in_tx(tx, alts);
+
         eprintln!(
             "[sim_executed] route_sig={:032x} source={} route_labels={} programs={}",
             route_sig, ix_source, route_labels, route_programs
         );
         match svm.simulate_transaction(litesvm_tx) {
             Ok(info) => {
+                // The route executed without reverting — every DEX in it is
+                // "seen" with no culprit (unprofitable is not a DEX failure).
+                metrics.record_dex_sim(&dex_programs, None);
                 // post_accounts: Vec<(Address, AccountSharedData)>
                 let wsol_ata_addr = pk_to_addr(self.wsol_ata);
                 let wsol_after = info
@@ -1257,6 +1263,12 @@ impl Simulator {
                     } else {
                         None
                     };
+                // Attribute this revert to the responsible DEX (prefer the inner
+                // program that hit InvalidAccountOwner, else the first failure).
+                metrics.record_dex_sim(
+                    &dex_programs,
+                    invalid_owner_program.or(generic_failed_program),
+                );
                 if let Some(program) = invalid_owner_program {
                     eprintln!(
                         "[sim_invalid_account_owner] failed_program={} route_mentions_alphaq={} alphaq_route_accounts={} hint=account owner mismatch in local SVM; compare same tx with RPC and inspect route account dump",
@@ -1744,6 +1756,26 @@ fn transaction_mentions_program(
     resolve_tx_account_keys(tx, alts)
         .iter()
         .any(|pk| pk == program)
+}
+
+/// The set of registered DEX/aggregator program ids referenced by this tx.
+/// Used to attribute simulation outcomes to specific exchanges.
+fn dex_programs_in_tx(
+    tx: &VersionedTransaction,
+    alts: &[AddressLookupTableAccount],
+) -> Vec<Pubkey> {
+    let registry: HashSet<Pubkey> = crate::program_registry::PROGRAMS
+        .iter()
+        .filter_map(|(id, _)| Pubkey::try_from(*id).ok())
+        .collect();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for pk in resolve_tx_account_keys(tx, alts) {
+        if registry.contains(&pk) && seen.insert(pk) {
+            out.push(pk);
+        }
+    }
+    out
 }
 
 fn jupiter_route_account_keys_for_program(
