@@ -2,6 +2,7 @@
 mod account_cache;
 mod alt_cache;
 mod arbitrage;
+mod auto_missing_accounts;
 mod blockhash_cache;
 mod config;
 mod dex_accounts;
@@ -43,6 +44,18 @@ const SIM_STATIC_EXTRA_ACCOUNTS: &[&str] = &[
     "Enc6rB84ZwGxZU8aqAF41dRJxg3yesiJgD7uJFVhMraM",
     "GswwnegnBMWEuEsptDCBDmRB9YtG5zjetTSw7RunUQMY",
 ];
+
+/// Parse a config commitment string into a `CommitmentConfig`. Defaults to
+/// `processed` for anything unrecognised so the RPC stays aligned with the
+/// Yellowstone stream.
+fn parse_commitment(level: &str) -> solana_sdk::commitment_config::CommitmentConfig {
+    use solana_sdk::commitment_config::CommitmentConfig;
+    match level.trim().to_ascii_lowercase().as_str() {
+        "finalized" => CommitmentConfig::finalized(),
+        "confirmed" => CommitmentConfig::confirmed(),
+        _ => CommitmentConfig::processed(),
+    }
+}
 
 fn main() -> Result<()> {
     let log_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "error".to_string());
@@ -86,7 +99,31 @@ async fn async_main(config: config::Config) -> Result<()> {
 
     let trading_keypair = Arc::new(wallet::read_keypair(&config.jito.trading_keypair)?);
 
-    let rpc_client = Arc::new(RpcClient::new(config.rpc.url.clone()));
+    // Match the RPC commitment to the Yellowstone stream commitment
+    // (processed) so account fetches, sim-compare, and retry snapshots read
+    // the same slot the cache is fed from. Reading finalized state (the
+    // RpcClient::new default) makes every hot pool look stale and feeds the
+    // retry path data OLDER than the cache it is trying to correct.
+    let rpc_commitment = parse_commitment(&config.rpc.commitment);
+    eprintln!(
+        "[rpc_commitment] level={} (stream is processed; keep these aligned)",
+        config.rpc.commitment
+    );
+    let rpc_client = Arc::new(RpcClient::new_with_commitment(
+        config.rpc.url.clone(),
+        rpc_commitment,
+    ));
+    let fallback_rpcs: Arc<Vec<Arc<RpcClient>>> = Arc::new(
+        config
+            .rpc
+            .fallback_rpc_urls
+            .iter()
+            .map(|url| Arc::new(RpcClient::new_with_commitment(url.clone(), rpc_commitment)))
+            .collect(),
+    );
+    if !fallback_rpcs.is_empty() {
+        eprintln!("[rpc_fallback] configured {} fallback RPC(s)", fallback_rpcs.len());
+    }
 
     let wsol_mint = solana_sdk::pubkey::Pubkey::from_str_const(tokens::WSOL_MINT);
     let wsol_ata = spl_associated_token_account::get_associated_token_address(
@@ -116,7 +153,7 @@ async fn async_main(config: config::Config) -> Result<()> {
 
     let metis = Arc::new(metis::MetisClient::new(
         &config.metis.url,
-        config.performance.quote_timeout_ms,
+        config.performance.quote_timeout_ms.max(config.performance.swap_instructions_timeout_ms),
     ));
 
     let jito_client = Arc::new(jito::JitoClient::new(&config.jito.urls, &config.jito.uuid));
@@ -148,7 +185,10 @@ async fn async_main(config: config::Config) -> Result<()> {
     };
 
     let (sim_cache, sim_pool, mix_registry) = if config.simulation.enabled {
-        let cache = account_cache::AccountCache::new(rpc_client.clone());
+        let cache = account_cache::AccountCache::new_with_fallbacks(
+            rpc_client.clone(),
+            fallback_rpcs.clone(),
+        );
         let manual_accounts_root =
             manual_sim_accounts::output_root_from_dex_dir(&config.simulation.dex_dir);
         let manual_sim_accounts_path = manual_accounts_root.join("manual_sim_accounts.json");
@@ -157,6 +197,7 @@ async fn async_main(config: config::Config) -> Result<()> {
         let tx_static_account_cache_path = manual_accounts_root.join("tx_static_account_cache.json");
 
         manual_sim_accounts::load_cached_accounts_into_cache(&manual_account_cache_path, &cache)?;
+        auto_missing_accounts::load_cache_into_account_cache(&manual_accounts_root, &cache);
         cache.load_tx_static_account_cache(&tx_static_account_cache_path)?;
         let tx_static_refresh_accounts =
             cache.tx_static_refresh_pubkeys(&tx_static_account_cache_path)?;
@@ -169,6 +210,13 @@ async fn async_main(config: config::Config) -> Result<()> {
             config.simulation.prefetch_pools_per_second,
         )
         .await?;
+
+        let missing_handle = Arc::new(auto_missing_accounts::start(
+            &manual_accounts_root,
+            rpc_client.clone(),
+            fallback_rpcs.clone(),
+            cache.clone(),
+        ));
 
         eprintln!("[rpc_fetch_reason] reason=block_time count=1 pubkeys_sample=[]");
         if let Ok(s) = rpc_client.get_slot() {
@@ -313,6 +361,7 @@ async fn async_main(config: config::Config) -> Result<()> {
             manual_accounts_root.clone(),
             cache.stream_slot(),
             cache.stream_unix_timestamp(),
+            Some(missing_handle),
         )?;
         eprintln!(
             "[simulator_ready] true workers={} so_dir={}",

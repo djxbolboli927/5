@@ -22,11 +22,12 @@ use solana_account::Account;
 use solana_address::Address;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::prelude::{
@@ -40,6 +41,10 @@ use yellowstone_grpc_proto::prelude::{
 pub struct AccountCache {
     inner: Arc<DashMap<Pubkey, Account>>,
     rpc: Arc<RpcClient>,
+    /// Extra RPC endpoints tried in order when `rpc` fails a
+    /// `getMultipleAccounts` call. Used ONLY for account data — never for
+    /// blockhash queries, transaction simulation, or Jito submission.
+    fallback_rpcs: Arc<Vec<Arc<RpcClient>>>,
     /// Slot of the most recent Yellowstone account update. The simulator
     /// reads this to set LiteSVM's Clock.slot — no RPC call needed.
     stream_slot: Arc<AtomicU64>,
@@ -48,6 +53,18 @@ pub struct AccountCache {
     timestamp_seed_unix: Arc<AtomicI64>,
     tx_static_cache_path: Arc<RwLock<Option<PathBuf>>>,
     tx_static_cache_lock: Arc<Mutex<()>>,
+    /// Accounts to add to the live Yellowstone subscription at runtime
+    /// (token vaults and other writable state NOT covered by the owner
+    /// filter). Grows as the simulator discovers stale/missing accounts.
+    dynamic_accounts: Arc<Mutex<HashSet<Pubkey>>>,
+    /// Signals the stream task to re-send its SubscribeRequest after
+    /// `dynamic_accounts` changes. Multiple rapid additions collapse into a
+    /// single wakeup, so re-subscription is naturally debounced.
+    resubscribe_notify: Arc<Notify>,
+    /// DEX program ids already covered by the "dex_pools" owner filter. Used
+    /// to skip redundant per-account subscriptions for pool state that the
+    /// owner filter already streams.
+    dex_owner_set: Arc<RwLock<HashSet<Pubkey>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -88,15 +105,85 @@ struct TxStaticAccountCacheEntry {
 
 impl AccountCache {
     pub fn new(rpc: Arc<RpcClient>) -> Self {
+        Self::new_with_fallbacks(rpc, Arc::new(vec![]))
+    }
+
+    pub fn new_with_fallbacks(rpc: Arc<RpcClient>, fallback_rpcs: Arc<Vec<Arc<RpcClient>>>) -> Self {
         Self {
             inner: Arc::new(DashMap::with_capacity(4096)),
             rpc,
+            fallback_rpcs,
             stream_slot: Arc::new(AtomicU64::new(0)),
             stream_unix_timestamp: Arc::new(AtomicI64::new(fallback_unix_timestamp())),
             timestamp_seed_slot: Arc::new(AtomicU64::new(0)),
             timestamp_seed_unix: Arc::new(AtomicI64::new(fallback_unix_timestamp())),
             tx_static_cache_path: Arc::new(RwLock::new(None)),
             tx_static_cache_lock: Arc::new(Mutex::new(())),
+            dynamic_accounts: Arc::new(Mutex::new(HashSet::new())),
+            resubscribe_notify: Arc::new(Notify::new()),
+            dex_owner_set: Arc::new(RwLock::new(HashSet::new())),
+        }
+    }
+
+    /// Call `getMultipleAccounts` on the primary RPC. If it fails, try each
+    /// fallback in order. Only account-data paths use this — never blockhash
+    /// or transaction simulation.
+    fn get_multiple_accounts_with_fallback(
+        &self,
+        keys: &[Pubkey],
+    ) -> solana_client::client_error::Result<Vec<Option<solana_sdk::account::Account>>> {
+        match self.rpc.get_multiple_accounts(keys) {
+            Ok(r) => return Ok(r),
+            Err(primary_err) => {
+                for (i, fallback) in self.fallback_rpcs.iter().enumerate() {
+                    match fallback.get_multiple_accounts(keys) {
+                        Ok(r) => {
+                            eprintln!(
+                                "[rpc_fallback] accounts={} primary_err={} used_fallback_idx={}",
+                                keys.len(),
+                                primary_err,
+                                i
+                            );
+                            return Ok(r);
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                Err(primary_err)
+            }
+        }
+    }
+
+    /// Add a single account to the live Yellowstone subscription at runtime.
+    /// Used for writable token vaults and foreign-owned state that the
+    /// owner filter does not capture, so the cache keeps them fresh instead
+    /// of serving a stale startup snapshot. Returns true if newly added.
+    pub fn subscribe_account(&self, pk: Pubkey) -> bool {
+        let newly_added = {
+            let mut set = self.dynamic_accounts.lock().unwrap();
+            set.insert(pk)
+        };
+        if newly_added {
+            self.resubscribe_notify.notify_one();
+        }
+        newly_added
+    }
+
+    /// Subscribe a writable account to the live stream only if its owner is
+    /// NOT already covered by the "dex_pools" owner filter. This targets the
+    /// real staleness gap (SPL-Token vaults, foreign-owned PDAs) without
+    /// redundantly re-subscribing pool state the owner filter already streams.
+    pub fn note_uncovered_writable(&self, pk: Pubkey, owner: &Pubkey) {
+        let covered = self
+            .dex_owner_set
+            .read()
+            .map(|set| set.contains(owner))
+            .unwrap_or(false);
+        if !covered && self.subscribe_account(pk) {
+            eprintln!(
+                "[grpc_dynamic_subscribe] pubkey={} owner={} reason=uncovered_writable",
+                pk, owner
+            );
         }
     }
 
@@ -268,7 +355,7 @@ impl AccountCache {
             loop {
                 attempt += 1;
                 log_rpc_fetch_reason("tx_static_unknown", &chunk_keys);
-                match self.rpc.get_multiple_accounts(&chunk_keys) {
+                match self.get_multiple_accounts_with_fallback(&chunk_keys) {
                     Ok(accounts) => {
                         for (pk, acct_opt) in chunk_keys.iter().zip(accounts.into_iter()) {
                             match acct_opt {
@@ -364,10 +451,29 @@ impl AccountCache {
                     requests += 1;
                     log_rpc_fetch_reason("tx_static_unknown", &chunk_keys);
                     let rpc = self.rpc.clone();
+                    let fallback_rpcs = self.fallback_rpcs.clone();
                     let request_keys = chunk_keys.clone();
-                    let result =
-                        tokio::task::spawn_blocking(move || rpc.get_multiple_accounts(&request_keys))
-                            .await;
+                    let result = tokio::task::spawn_blocking(move || {
+                        match rpc.get_multiple_accounts(&request_keys) {
+                            Ok(r) => Ok(r),
+                            Err(primary_err) => {
+                                for (i, fb) in fallback_rpcs.iter().enumerate() {
+                                    match fb.get_multiple_accounts(&request_keys) {
+                                        Ok(r) => {
+                                            eprintln!(
+                                                "[rpc_fallback] accounts={} primary_err={} used_fallback_idx={}",
+                                                request_keys.len(), primary_err, i
+                                            );
+                                            return Ok(r);
+                                        }
+                                        Err(_) => continue,
+                                    }
+                                }
+                                Err(primary_err)
+                            }
+                        }
+                    })
+                    .await;
 
                     match result {
                         Ok(Ok(accounts)) => {
@@ -464,7 +570,7 @@ impl AccountCache {
         for chunk in keys.chunks(100) {
             let chunk_keys = chunk.to_vec();
             log_rpc_fetch_reason("failed_account_compare", &chunk_keys);
-            match self.rpc.get_multiple_accounts(&chunk_keys) {
+            match self.get_multiple_accounts_with_fallback(&chunk_keys) {
                 Ok(accounts) => {
                     for (pk, acct_opt) in chunk_keys.iter().zip(accounts.into_iter()) {
                         match acct_opt {
@@ -593,11 +699,24 @@ impl AccountCache {
         dex_program_ids: Vec<String>,
         extra_accounts: Vec<Pubkey>,
     ) {
+        // Record which program ids the owner filter already covers, so
+        // note_uncovered_writable can skip redundant per-account subscriptions.
+        {
+            let mut owner_set = self.dex_owner_set.write().unwrap();
+            for id in &dex_program_ids {
+                if let Ok(pk) = Pubkey::try_from(id.as_str()) {
+                    owner_set.insert(pk);
+                }
+            }
+        }
+
         let cache = self.inner.clone();
         let stream_slot = self.stream_slot.clone();
         let stream_unix_timestamp = self.stream_unix_timestamp.clone();
         let timestamp_seed_slot = self.timestamp_seed_slot.clone();
         let timestamp_seed_unix = self.timestamp_seed_unix.clone();
+        let dynamic_accounts = self.dynamic_accounts.clone();
+        let resubscribe_notify = self.resubscribe_notify.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_millis(500);
             loop {
@@ -611,6 +730,8 @@ impl AccountCache {
                     &stream_unix_timestamp,
                     &timestamp_seed_slot,
                     &timestamp_seed_unix,
+                    &dynamic_accounts,
+                    &resubscribe_notify,
                 )
                 .await
                 {
@@ -732,29 +853,12 @@ fn log_rpc_fetch_reason(reason: &str, pubkeys: &[Pubkey]) {
     );
 }
 
-async fn run_stream(
-    endpoint: &str,
-    x_token: &str,
+fn build_subscribe_request(
     dex_program_ids: &[String],
     extra_accounts: &[Pubkey],
-    cache: &Arc<DashMap<Pubkey, Account>>,
-    stream_slot: &Arc<AtomicU64>,
-    stream_unix_timestamp: &Arc<AtomicI64>,
-    timestamp_seed_slot: &Arc<AtomicU64>,
-    timestamp_seed_unix: &Arc<AtomicI64>,
-) -> Result<()> {
-    let mut client = GeyserGrpcClient::build_from_shared(endpoint.to_string())?
-        .x_token(Some(x_token.to_string()))?
-        .tls_config(yellowstone_grpc_client::ClientTlsConfig::new().with_native_roots())?
-        .max_decoding_message_size(64 * 1024 * 1024)
-        .connect()
-        .await
-        .context("gRPC connect failed")?;
-
-    info!(endpoint, "gRPC connected");
-
-    let mut accounts_filter: HashMap<String, SubscribeRequestFilterAccounts> =
-        HashMap::new();
+    dynamic_accounts: &Arc<Mutex<HashSet<Pubkey>>>,
+) -> SubscribeRequest {
+    let mut accounts_filter: HashMap<String, SubscribeRequestFilterAccounts> = HashMap::new();
 
     accounts_filter.insert(
         "dex_pools".to_string(),
@@ -766,11 +870,18 @@ async fn run_stream(
         },
     );
 
-    if !extra_accounts.is_empty() {
+    // Merge the static startup extras with the runtime-discovered accounts
+    // (token vaults etc.) into one specific-account filter.
+    let mut specific: HashSet<Pubkey> = extra_accounts.iter().copied().collect();
+    {
+        let dyn_set = dynamic_accounts.lock().unwrap();
+        specific.extend(dyn_set.iter().copied());
+    }
+    if !specific.is_empty() {
         accounts_filter.insert(
             "extras".to_string(),
             SubscribeRequestFilterAccounts {
-                account: extra_accounts.iter().map(|p| p.to_string()).collect(),
+                account: specific.iter().map(|p| p.to_string()).collect(),
                 owner: vec![],
                 filters: vec![],
                 nonempty_txn_signature: None,
@@ -778,7 +889,7 @@ async fn run_stream(
         );
     }
 
-    let request = SubscribeRequest {
+    SubscribeRequest {
         slots: HashMap::new(),
         accounts: accounts_filter,
         transactions: HashMap::new(),
@@ -790,7 +901,34 @@ async fn run_stream(
         accounts_data_slice: vec![],
         ping: None,
         from_slot: None,
-    };
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_stream(
+    endpoint: &str,
+    x_token: &str,
+    dex_program_ids: &[String],
+    extra_accounts: &[Pubkey],
+    cache: &Arc<DashMap<Pubkey, Account>>,
+    stream_slot: &Arc<AtomicU64>,
+    stream_unix_timestamp: &Arc<AtomicI64>,
+    timestamp_seed_slot: &Arc<AtomicU64>,
+    timestamp_seed_unix: &Arc<AtomicI64>,
+    dynamic_accounts: &Arc<Mutex<HashSet<Pubkey>>>,
+    resubscribe_notify: &Arc<Notify>,
+) -> Result<()> {
+    let mut client = GeyserGrpcClient::build_from_shared(endpoint.to_string())?
+        .x_token(Some(x_token.to_string()))?
+        .tls_config(yellowstone_grpc_client::ClientTlsConfig::new().with_native_roots())?
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .connect()
+        .await
+        .context("gRPC connect failed")?;
+
+    info!(endpoint, "gRPC connected");
+
+    let request = build_subscribe_request(dex_program_ids, extra_accounts, dynamic_accounts);
 
     let (mut tx, mut stream) = client
         .subscribe_with_request(Some(request))
@@ -800,50 +938,112 @@ async fn run_stream(
     info!("gRPC subscription active; waiting for account updates");
 
     let mut count: u64 = 0;
-    while let Some(msg) = stream.next().await {
-        let msg = msg.context("stream yielded error")?;
-        match msg.update_oneof {
-            Some(UpdateOneof::Account(a)) => {
-                stream_slot.store(a.slot, Ordering::Relaxed);
-                let seed_slot = timestamp_seed_slot.load(Ordering::Relaxed);
-                let seed_unix = timestamp_seed_unix.load(Ordering::Relaxed);
-                stream_unix_timestamp.store(
-                    estimate_unix_timestamp(a.slot, seed_slot, seed_unix),
-                    Ordering::Relaxed,
-                );
+    // P4 watchdog: track stream liveness. If the slot stops advancing while
+    // we keep simulating, the cache is silently frozen — warn loudly.
+    let mut watchdog = tokio::time::interval(Duration::from_secs(10));
+    watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    watchdog.tick().await; // drain immediate first tick
+    let mut last_watchdog_slot: u64 = stream_slot.load(Ordering::Relaxed);
+    let mut last_watchdog_count: u64 = 0;
 
-                if let Some(info) = a.account {
-                    let pk = match Pubkey::try_from(info.pubkey.as_slice()) {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    };
-                    let owner_bytes: [u8; 32] = info.owner.as_slice()
-                        .try_into()
-                        .unwrap_or([0u8; 32]);
-                    let account = Account {
-                        lamports: info.lamports,
-                        data: info.data,
-                        owner: Address::from(owner_bytes),
-                        executable: info.executable,
-                        rent_epoch: info.rent_epoch,
-                    };
-                    cache.insert(pk, account);
-                    count += 1;
-                    if count % 10_000 == 0 {
-                        debug!(count, size = cache.len(), "cache growth");
+    loop {
+        tokio::select! {
+            biased;
+            // Re-subscribe when new dynamic accounts are added.
+            _ = resubscribe_notify.notified() => {
+                let dyn_len = dynamic_accounts.lock().unwrap().len();
+                let req = build_subscribe_request(dex_program_ids, extra_accounts, dynamic_accounts);
+                match tx.send(req).await {
+                    Ok(()) => eprintln!(
+                        "[grpc_resubscribe] dynamic_accounts={} status=sent",
+                        dyn_len
+                    ),
+                    Err(e) => {
+                        warn!(error = %e, "gRPC re-subscribe failed; reconnecting");
+                        return Err(anyhow::anyhow!("re-subscribe send failed: {e}"));
                     }
                 }
             }
-            Some(UpdateOneof::Ping(_)) => {
-                let _ = tx
-                    .send(SubscribeRequest {
-                        ping: Some(SubscribeRequestPing { id: 1 }),
-                        ..Default::default()
-                    })
-                    .await;
+            _ = watchdog.tick() => {
+                let now_slot = stream_slot.load(Ordering::Relaxed);
+                let updates = count.saturating_sub(last_watchdog_count);
+                if now_slot <= last_watchdog_slot || updates == 0 {
+                    warn!(
+                        cache_slot = now_slot,
+                        last_slot = last_watchdog_slot,
+                        updates_in_window = updates,
+                        "[stream_stalled] Yellowstone slot not advancing; cache may be serving frozen pool state"
+                    );
+                    eprintln!(
+                        "[stream_stalled] cache_slot={} last_slot={} updates_in_window={} action=stream_frozen_check_endpoint",
+                        now_slot, last_watchdog_slot, updates
+                    );
+                } else {
+                    eprintln!(
+                        "[stream_health] cache_slot={} slot_advanced={} updates_in_window={} cache_size={}",
+                        now_slot,
+                        now_slot.saturating_sub(last_watchdog_slot),
+                        updates,
+                        cache.len()
+                    );
+                }
+                last_watchdog_slot = now_slot;
+                last_watchdog_count = count;
             }
-            _ => {}
+            msg = stream.next() => {
+                let Some(msg) = msg else { break };
+                let msg = msg.context("stream yielded error")?;
+                match msg.update_oneof {
+                    Some(UpdateOneof::Account(a)) => {
+                        stream_slot.store(a.slot, Ordering::Relaxed);
+                        let seed_slot = timestamp_seed_slot.load(Ordering::Relaxed);
+                        let seed_unix = timestamp_seed_unix.load(Ordering::Relaxed);
+                        stream_unix_timestamp.store(
+                            estimate_unix_timestamp(a.slot, seed_slot, seed_unix),
+                            Ordering::Relaxed,
+                        );
+
+                        if let Some(info) = a.account {
+                            let pk = match Pubkey::try_from(info.pubkey.as_slice()) {
+                                Ok(p) => p,
+                                Err(_) => continue,
+                            };
+                            let owner_bytes: [u8; 32] = info.owner.as_slice()
+                                .try_into()
+                                .unwrap_or([0u8; 32]);
+                            let account = Account {
+                                lamports: info.lamports,
+                                data: info.data,
+                                owner: Address::from(owner_bytes),
+                                executable: info.executable,
+                                rent_epoch: info.rent_epoch,
+                            };
+                            cache.insert(pk, account);
+                            count += 1;
+                            if count % 10_000 == 0 {
+                                debug!(count, size = cache.len(), "cache growth");
+                            }
+                        }
+                    }
+                    Some(UpdateOneof::Ping(_)) => {
+                        let _ = tx
+                            .send(SubscribeRequest {
+                                ping: Some(SubscribeRequestPing { id: 1 }),
+                                ..Default::default()
+                            })
+                            .await;
+                    }
+                    _ => {}
+                }
+            }
         }
     }
     Ok(())
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

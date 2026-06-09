@@ -55,6 +55,23 @@ pub struct JitoConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct RpcConfig {
     pub url: String,
+    /// Commitment level for all RPC reads (account fetches, sim-compare,
+    /// retry snapshots). Must match the Yellowstone stream commitment
+    /// ("processed") so the cache and the RPC baseline see the same slot.
+    /// Using the default "finalized" makes every actively-traded pool look
+    /// stale because finalized lags the processed stream by ~30+ slots.
+    #[serde(default = "default_rpc_commitment")]
+    pub commitment: String,
+    /// Additional public RPC endpoints tried in order when the primary RPC
+    /// fails an account-fetch (`getMultipleAccounts`). These are ONLY used
+    /// for account data — never for blockhash, transaction simulation, or
+    /// Jito submission. Leave empty to disable fallback.
+    #[serde(default)]
+    pub fallback_rpc_urls: Vec<String>,
+}
+
+fn default_rpc_commitment() -> String {
+    "processed".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]

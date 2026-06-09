@@ -69,8 +69,8 @@ const WHIRLPOOL_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc");
 const SOLFI_V2_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF");
-const MAX_RPC_SIM_COMPARE_PER_PROCESS: u64 = 20;
-const MAX_RPC_SNAPSHOT_RETRY_PER_PROCESS: u64 = 20;
+const MAX_RPC_SIM_COMPARE_PER_PROCESS: u64 = 1_000;
+const MAX_RPC_SNAPSHOT_RETRY_PER_PROCESS: u64 = u64::MAX;
 const MAX_SIM_CLOCK_LOGS_PER_PROCESS: u64 = 100;
 static RPC_SIM_COMPARE_COUNT: AtomicU64 = AtomicU64::new(0);
 static RPC_SNAPSHOT_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -88,6 +88,10 @@ pub struct Simulator {
     payer_pubkey: Pubkey,
     loaded_programs: HashSet<Pubkey>,
     loaded_program_files: HashMap<Pubkey, String>,
+    /// Program bytecode kept in memory so the RPC-snapshot retry path can build
+    /// a fresh LiteSVM without re-reading ~28 .so files from disk on every
+    /// failed simulation (the retry runs per failure now that the cap is gone).
+    loaded_program_bytes: HashMap<Pubkey, Vec<u8>>,
     jito_tip_accounts: HashSet<Pubkey>,
     fail_closed: bool,
     /// Live mainnet slot from the Yellowstone gRPC stream (zero RPC).
@@ -95,6 +99,7 @@ pub struct Simulator {
     current_unix_timestamp: Arc<AtomicI64>,
     allow_hot_path_rpc_fetch: bool,
     manual_accounts_root: PathBuf,
+    missing_handle: Option<Arc<crate::auto_missing_accounts::AutoMissingAccountsHandle>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -201,6 +206,7 @@ impl Simulator {
         manual_accounts_root: PathBuf,
         current_slot: Arc<AtomicU64>,
         current_unix_timestamp: Arc<AtomicI64>,
+        missing_handle: Option<Arc<crate::auto_missing_accounts::AutoMissingAccountsHandle>>,
     ) -> Result<Self> {
         // Build the SVM with the full mainnet feature set.
         //
@@ -221,7 +227,8 @@ impl Simulator {
             .with_sigverify(false)
             .with_blockhash_check(false)
             .with_default_programs()
-            .with_mainnet_features();
+            .with_mainnet_features()
+            .with_feature_accounts();
 
         // warp_to_slot atomically advances Clock.slot, Clock.epoch,
         // SlotHashes, and EpochSchedule — everything PMM oracle staleness
@@ -249,6 +256,7 @@ impl Simulator {
         let mut missing = 0usize;
         let mut loaded_programs = HashSet::new();
         let mut loaded_program_files = HashMap::new();
+        let mut loaded_program_bytes = HashMap::new();
         for (pid_str, fname) in crate::program_registry::PROGRAMS {
             if fname.is_empty() {
                 continue;
@@ -265,7 +273,19 @@ impl Simulator {
             let path = path.unwrap();
             let pid = Pubkey::try_from(*pid_str)
                 .map_err(|e| anyhow!("bad program id {pid_str}: {e:?}"))?;
-            match svm.add_program_from_file(pk_to_addr(pid), &path) {
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[sim_program_load] program={pid} registry_file={fname} resolved={} exists=true loaded=false error=read:{e:?}",
+                        path.display()
+                    );
+                    warn!(program = %pid, path = %path.display(), error = ?e, "program read failed");
+                    missing += 1;
+                    continue;
+                }
+            };
+            match svm.add_program(pk_to_addr(pid), &bytes) {
                 Ok(()) => {
                     eprintln!(
                         "[sim_program_load] program={pid} registry_file={fname} resolved={} exists=true loaded=true",
@@ -274,6 +294,7 @@ impl Simulator {
                     debug!(program = %pid, path = %path.display(), "program loaded");
                     loaded_programs.insert(pid);
                     loaded_program_files.insert(pid, path.display().to_string());
+                    loaded_program_bytes.insert(pid, bytes);
                     loaded += 1;
                 }
                 Err(e) => {
@@ -294,6 +315,7 @@ impl Simulator {
             payer_pubkey,
             loaded_programs,
             loaded_program_files,
+            loaded_program_bytes,
             jito_tip_accounts: crate::transaction::jito_tip_pubkeys()
                 .into_iter()
                 .collect(),
@@ -302,6 +324,7 @@ impl Simulator {
             current_unix_timestamp,
             allow_hot_path_rpc_fetch,
             manual_accounts_root,
+            missing_handle,
         })
     }
 
@@ -376,17 +399,18 @@ impl Simulator {
             .with_sigverify(false)
             .with_blockhash_check(false)
             .with_default_programs()
-            .with_mainnet_features();
+            .with_mainnet_features()
+            .with_feature_accounts();
         svm.warp_to_slot(slot);
         set_live_clock(&mut svm, slot, unix_timestamp);
 
-        let mut programs = self.loaded_program_files.iter().collect::<Vec<_>>();
+        // Reuse the in-memory bytecode captured at startup — no disk I/O on the
+        // retry hot path.
+        let mut programs = self.loaded_program_bytes.iter().collect::<Vec<_>>();
         programs.sort_by_key(|(program, _)| program.to_string());
-        for (program, path) in programs {
-            svm.add_program_from_file(pk_to_addr(*program), Path::new(path.as_str()))
-                .with_context(|| {
-                    format!("snapshot add_program_from_file program={program} path={path}")
-                })?;
+        for (program, bytes) in programs {
+            svm.add_program(pk_to_addr(*program), bytes)
+                .with_context(|| format!("snapshot add_program program={program}"))?;
         }
         Ok(svm)
     }
@@ -408,14 +432,14 @@ impl Simulator {
         route_programs: &str,
         lite_err: &str,
         ix_source: &str,
-    ) {
+    ) -> Option<SimOutcome> {
         let attempt = RPC_SNAPSHOT_RETRY_COUNT.fetch_add(1, Ordering::Relaxed);
         if attempt >= MAX_RPC_SNAPSHOT_RETRY_PER_PROCESS {
             eprintln!(
                 "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} route_labels={} programs={} failed_program={} status=skipped reason=process_cap lite_err={}",
                 route_sig, ix_source, route_labels, route_programs, failed_program, lite_err
             );
-            return;
+            return None;
         }
 
         let mut metas = account_metas.to_vec();
@@ -452,11 +476,13 @@ impl Simulator {
                     e,
                     lite_err
                 );
-                return;
+                return None;
             }
         };
 
-        let mut injected = 0usize;
+        let mut injected_rpc = 0usize;
+        let mut injected_synthetic = 0usize;
+        let mut synthetic_notfound_rpc = 0usize;
         let mut missing = 0usize;
         let mut rpc_errors = 0usize;
 
@@ -465,7 +491,7 @@ impl Simulator {
                 svm.set_account(pk_to_addr(alt.key), raw)
                     .map_err(|e| anyhow!("set snapshot ALT {} failed: {e:?}", alt.key))
             }) {
-                Ok(()) => injected += 1,
+                Ok(()) => injected_rpc += 1,
                 Err(e) => eprintln!(
                     "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} failed_program={} status=alt_inject_error alt={} error={}",
                     route_sig, ix_source, failed_program, alt.key, e
@@ -485,7 +511,7 @@ impl Simulator {
                         route_sig, ix_source, failed_program, pk, e
                     );
                 } else {
-                    injected += 1;
+                    injected_synthetic += 1;
                 }
                 continue;
             }
@@ -496,7 +522,7 @@ impl Simulator {
                         route_sig, ix_source, failed_program, pk, e
                     );
                 } else {
-                    injected += 1;
+                    injected_synthetic += 1;
                 }
                 continue;
             }
@@ -506,27 +532,79 @@ impl Simulator {
                     if account.executable() {
                         continue;
                     }
+                    // Immediately update the live AccountCache so the next
+                    // simulation of this route finds fresh state without
+                    // another RPC round-trip. For writable pool-state accounts
+                    // owned by a registered DEX program, Yellowstone's owner
+                    // filter will keep the entry live going forward.
+                    cache.insert_manual(*pk, account.clone());
+                    // Writable accounts NOT covered by the owner filter
+                    // (token vaults, foreign-owned PDAs) would otherwise go
+                    // stale again after this one-shot insert. Add them to the
+                    // live gRPC subscription so the stream keeps them fresh.
+                    if meta.is_writable {
+                        if let Ok(owner_pk) = Pubkey::try_from(account.owner().as_ref()) {
+                            cache.note_uncovered_writable(*pk, &owner_pk);
+                        }
+                    }
                     if let Err(e) = svm.set_account(pk_to_addr(*pk), account.clone()) {
                         eprintln!(
                             "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} failed_program={} status=account_inject_error pubkey={} error={:?}",
                             route_sig, ix_source, failed_program, pk, e
                         );
                     } else {
-                        injected += 1;
+                        injected_rpc += 1;
                     }
                 }
                 Some(AccountFetchResult::NotFound) | None => {
                     if synthetic_readonly_system_accounts.contains(pk) {
+                        // RPC also says this account doesn't exist. It may be an
+                        // uninitialized DEX account (e.g. tick array), which would
+                        // cause owner-check failures even on-chain. Log + queue for
+                        // background fetch to confirm.
+                        synthetic_notfound_rpc += 1;
+                        eprintln!(
+                            "[sim_retry_synthetic_notfound_rpc] route_sig={:032x} source={} failed_program={} pk={} is_writable={} note=account_not_found_on_rpc_injecting_synthetic_owner_check_may_fail",
+                            route_sig, ix_source, failed_program, pk, meta.is_writable
+                        );
+                        if let Some(handle) = &self.missing_handle {
+                            handle.record(crate::auto_missing_accounts::MissingAccountEvent {
+                                pubkey: *pk,
+                                route_sig,
+                                route_labels: route_labels.to_string(),
+                                programs: route_programs.to_string(),
+                                source: "retry_synthetic_notfound_rpc".to_string(),
+                                is_signer: meta.is_signer,
+                                is_writable: meta.is_writable,
+                                created_by_setup: false,
+                            });
+                        }
                         if let Err(e) = svm.set_account(pk_to_addr(*pk), synthetic_system_account(0)) {
                             eprintln!(
                                 "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} failed_program={} status=account_inject_error pubkey={} error={:?}",
                                 route_sig, ix_source, failed_program, pk, e
                             );
                         } else {
-                            injected += 1;
+                            injected_synthetic += 1;
                         }
                     } else if !created_by_setup.contains(pk) {
                         missing += 1;
+                        // Queue to background fetcher — it will keep retrying
+                        // until the account appears or crosses the 8000 threshold.
+                        if let Some(handle) = &self.missing_handle {
+                            handle.record(
+                                crate::auto_missing_accounts::MissingAccountEvent {
+                                    pubkey: *pk,
+                                    route_sig,
+                                    route_labels: route_labels.to_string(),
+                                    programs: route_programs.to_string(),
+                                    source: "rpc_retry_not_found".to_string(),
+                                    is_signer: meta.is_signer,
+                                    is_writable: meta.is_writable,
+                                    created_by_setup: false,
+                                },
+                            );
+                        }
                     }
                 }
                 Some(AccountFetchResult::Error { .. }) => {
@@ -535,18 +613,23 @@ impl Simulator {
             }
         }
 
+        let injected = injected_rpc + injected_synthetic;
+
         if missing > 0 || rpc_errors > 0 {
             metrics
                 .sim_retry_rpc_snapshot_fail
                 .fetch_add(1, Ordering::Relaxed);
             eprintln!(
-                "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} route_labels={} programs={} failed_program={} status=missing_snapshot_accounts injected={} missing={} rpc_errors={} cache_slot={} rpc_context_slot={} slot_delta={} lite_err={}",
+                "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} route_labels={} programs={} failed_program={} status=missing_snapshot_accounts injected={} injected_rpc={} injected_synthetic={} synthetic_notfound_rpc={} missing={} rpc_errors={} cache_slot={} rpc_context_slot={} slot_delta={} lite_err={}",
                 route_sig,
                 ix_source,
                 route_labels,
                 route_programs,
                 failed_program,
                 injected,
+                injected_rpc,
+                injected_synthetic,
+                synthetic_notfound_rpc,
                 missing,
                 rpc_errors,
                 cache_slot,
@@ -554,7 +637,7 @@ impl Simulator {
                 slot_delta,
                 lite_err
             );
-            return;
+            return None;
         }
 
         let wsol_before = parse_wsol_amount(&svm, self.wsol_ata);
@@ -568,7 +651,7 @@ impl Simulator {
                     "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} route_labels={} programs={} failed_program={} status=tx_convert_error error={} lite_err={}",
                     route_sig, ix_source, route_labels, route_programs, failed_program, e, lite_err
                 );
-                return;
+                return None;
             }
         };
 
@@ -585,13 +668,13 @@ impl Simulator {
                     .and_then(|(_, acc)| parse_token_amount(acc.data()))
                     .unwrap_or(wsol_before);
                 let min_wsol_after = wsol_before.saturating_add(min_wsol_gain);
-                let result_kind = if wsol_after >= min_wsol_after {
-                    "pass_profitable"
+                let (result_kind, profitable) = if wsol_after >= min_wsol_after {
+                    ("pass_profitable", true)
                 } else {
-                    "pass_unprofitable"
+                    ("pass_unprofitable", false)
                 };
                 eprintln!(
-                    "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} route_labels={} programs={} failed_program={} status=ok result={} injected={} cache_slot={} rpc_context_slot={} slot_delta={} compute_units={} wsol_before={} wsol_after={} min_after={} diagnosis=stale_cache_possible lite_err={}",
+                    "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} route_labels={} programs={} failed_program={} status=ok result={} injected={} injected_rpc={} injected_synthetic={} synthetic_notfound_rpc={} cache_slot={} rpc_context_slot={} slot_delta={} compute_units={} wsol_before={} wsol_after={} min_after={} diagnosis=stale_cache_possible lite_err={}",
                     route_sig,
                     ix_source,
                     route_labels,
@@ -599,6 +682,9 @@ impl Simulator {
                     failed_program,
                     result_kind,
                     injected,
+                    injected_rpc,
+                    injected_synthetic,
+                    synthetic_notfound_rpc,
                     cache_slot,
                     rpc_context_slot,
                     slot_delta,
@@ -608,27 +694,64 @@ impl Simulator {
                     min_wsol_after,
                     lite_err
                 );
+                if profitable {
+                    return Some(SimOutcome {
+                        compute_units: info.meta.compute_units_consumed,
+                        wsol_before,
+                        wsol_after,
+                    });
+                }
+                None
             }
             Err(meta) => {
                 metrics
                     .sim_retry_rpc_snapshot_fail
                     .fetch_add(1, Ordering::Relaxed);
                 let retry_err = format!("{:?}", meta.err);
+                let retry_diagnosis = if synthetic_notfound_rpc > 0 {
+                    "synthetic_accounts_not_on_rpc_likely_uninitialized"
+                } else {
+                    "route_or_logic_issue_possible"
+                };
                 eprintln!(
-                    "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} route_labels={} programs={} failed_program={} status=fail injected={} cache_slot={} rpc_context_slot={} slot_delta={} retry_err={} compute_units={} diagnosis=route_or_logic_issue_possible lite_err={}",
+                    "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} route_labels={} programs={} failed_program={} status=fail injected={} injected_rpc={} injected_synthetic={} synthetic_notfound_rpc={} cache_slot={} rpc_context_slot={} slot_delta={} retry_err={} compute_units={} diagnosis={} lite_err={}",
                     route_sig,
                     ix_source,
                     route_labels,
                     route_programs,
                     failed_program,
                     injected,
+                    injected_rpc,
+                    injected_synthetic,
+                    synthetic_notfound_rpc,
                     cache_slot,
                     rpc_context_slot,
                     slot_delta,
                     retry_err,
                     meta.meta.compute_units_consumed,
+                    retry_diagnosis,
                     lite_err
                 );
+                // On-chain this route succeeds but LiteSVM rejects it with
+                // InvalidAccountOwner even on a 100%-fresh RPC snapshot. Dump the
+                // owner LiteSVM actually presented for each account in the failing
+                // program's instruction vs the owner RPC reports, so the exact
+                // mismatching account is pinpointed.
+                if is_invalid_account_owner(&retry_err, &meta.meta.logs) {
+                    let owner_failed_program =
+                        first_failed_program_for_invalid_owner(&meta.meta.logs)
+                            .unwrap_or(*failed_program);
+                    dump_failing_program_owner_diagnosis(
+                        &svm,
+                        &owner_failed_program,
+                        tx,
+                        alts,
+                        &rpc_fetch.accounts,
+                        route_sig,
+                        ix_source,
+                    );
+                }
+                None
             }
         }
     }
@@ -793,6 +916,29 @@ impl Simulator {
                         meta.source.as_str()
                     );
                     synthetic_readonly_system_accounts.insert(*pk);
+                    // Queue for background fetch: if this account is owned by a DEX
+                    // program (e.g. AlphaQ tick arrays), giving it a synthetic
+                    // System-owned account will fail the DEX's ownership check.
+                    // The auto_missing service fetches it once; gRPC owner-filter
+                    // keeps it fresh on subsequent slots.
+                    if let Some(handle) = &self.missing_handle {
+                        handle.record(crate::auto_missing_accounts::MissingAccountEvent {
+                            pubkey: *pk,
+                            route_sig,
+                            route_labels: route_labels.to_string(),
+                            programs: route_programs.to_string(),
+                            source: "synthetic_alt_readonly".to_string(),
+                            is_signer: meta.is_signer,
+                            is_writable: meta.is_writable,
+                            created_by_setup: false,
+                        });
+                    }
+                    if contains_alphaq && alphaq_route_accounts.contains(pk) {
+                        eprintln!(
+                            "[sim_alphaq_synthetic_candidate] pk={} source={} note=alphaq_may_check_owner_of_this_account_and_fail",
+                            pk, meta.source.as_str()
+                        );
+                    }
                 } else {
                     if contains_alphaq && alphaq_route_accounts.contains(pk) {
                         log_missing_alphaq_route_account(meta, "hot_path_rpc_disabled_no_synthetic");
@@ -812,6 +958,18 @@ impl Simulator {
                             reason: "hot_path_rpc_disabled_no_synthetic".to_string(),
                         },
                     );
+                    if let Some(handle) = &self.missing_handle {
+                        handle.record(crate::auto_missing_accounts::MissingAccountEvent {
+                            pubkey: *pk,
+                            route_sig,
+                            route_labels: route_labels.to_string(),
+                            programs: route_programs.to_string(),
+                            source: meta.source.as_str().to_string(),
+                            is_signer: meta.is_signer,
+                            is_writable: meta.is_writable,
+                            created_by_setup: created_by_setup.contains(pk),
+                        });
+                    }
                     if meta.is_writable {
                         log_missing_writable(meta, "hot_path_rpc_disabled");
                     }
@@ -858,6 +1016,24 @@ impl Simulator {
                             meta.source.as_str()
                         );
                         synthetic_readonly_system_accounts.insert(*pk);
+                        if let Some(handle) = &self.missing_handle {
+                            handle.record(crate::auto_missing_accounts::MissingAccountEvent {
+                                pubkey: *pk,
+                                route_sig,
+                                route_labels: route_labels.to_string(),
+                                programs: route_programs.to_string(),
+                                source: "synthetic_alt_readonly_not_found".to_string(),
+                                is_signer: meta.is_signer,
+                                is_writable: meta.is_writable,
+                                created_by_setup: false,
+                            });
+                        }
+                        if contains_alphaq && alphaq_route_accounts.contains(pk) {
+                            eprintln!(
+                                "[sim_alphaq_synthetic_candidate] pk={} source={} reason=not_found note=alphaq_may_check_owner_of_this_account_and_fail",
+                                pk, meta.source.as_str()
+                            );
+                        }
                     } else {
                         if contains_alphaq && alphaq_route_accounts.contains(pk) {
                             log_missing_alphaq_route_account(meta, "not_found_no_synthetic");
@@ -882,6 +1058,24 @@ impl Simulator {
                             meta.source.as_str()
                         );
                         synthetic_readonly_system_accounts.insert(*pk);
+                        if let Some(handle) = &self.missing_handle {
+                            handle.record(crate::auto_missing_accounts::MissingAccountEvent {
+                                pubkey: *pk,
+                                route_sig,
+                                route_labels: route_labels.to_string(),
+                                programs: route_programs.to_string(),
+                                source: "synthetic_alt_readonly_rpc_error".to_string(),
+                                is_signer: meta.is_signer,
+                                is_writable: meta.is_writable,
+                                created_by_setup: false,
+                            });
+                        }
+                        if contains_alphaq && alphaq_route_accounts.contains(pk) {
+                            eprintln!(
+                                "[sim_alphaq_synthetic_candidate] pk={} source={} reason=rpc_error note=alphaq_may_check_owner_of_this_account_and_fail",
+                                pk, meta.source.as_str()
+                            );
+                        }
                     } else {
                         if contains_alphaq && alphaq_route_accounts.contains(pk) {
                             log_missing_alphaq_route_account(meta, "rpc_error_no_synthetic");
@@ -1026,12 +1220,18 @@ impl Simulator {
         // Convert solana-sdk 2.x VersionedTransaction → solana-transaction 3.x.
         let litesvm_tx = to_litesvm_tx(tx)?;
 
+        // DEX programs touched by this route — attributed to per-DEX sim stats.
+        let dex_programs = dex_programs_in_tx(tx, alts);
+
         eprintln!(
             "[sim_executed] route_sig={:032x} source={} route_labels={} programs={}",
             route_sig, ix_source, route_labels, route_programs
         );
         match svm.simulate_transaction(litesvm_tx) {
             Ok(info) => {
+                // The route executed without reverting — every DEX in it is
+                // "seen" with no culprit (unprofitable is not a DEX failure).
+                metrics.record_dex_sim(&dex_programs, None);
                 // post_accounts: Vec<(Address, AccountSharedData)>
                 let wsol_ata_addr = pk_to_addr(self.wsol_ata);
                 let wsol_after = info
@@ -1082,6 +1282,12 @@ impl Simulator {
                     } else {
                         None
                     };
+                // Attribute this revert to the responsible DEX (prefer the inner
+                // program that hit InvalidAccountOwner, else the first failure).
+                metrics.record_dex_sim(
+                    &dex_programs,
+                    invalid_owner_program.or(generic_failed_program),
+                );
                 if let Some(program) = invalid_owner_program {
                     eprintln!(
                         "[sim_invalid_account_owner] failed_program={} route_mentions_alphaq={} alphaq_route_accounts={} hint=account owner mismatch in local SVM; compare same tx with RPC and inspect route account dump",
@@ -1133,6 +1339,28 @@ impl Simulator {
                         );
                         debugged_failed_program = true;
                         compared_alphaq_invalid_owner = true;
+                        // Retry with fresh RPC snapshot: if local cache had a stale/wrong-owner
+                        // account, the snapshot will correct it. If the retry passes and the
+                        // route is profitable, return it so the bundle can be submitted.
+                        if let Some(outcome) = self.retry_with_rpc_snapshot(
+                            &program,
+                            cache,
+                            tx,
+                            alts,
+                            &account_metas,
+                            &synthetic_readonly_system_accounts,
+                            &created_by_setup,
+                            min_wsol_gain,
+                            metrics,
+                            route_sig,
+                            route_labels,
+                            route_programs,
+                            &lite_err,
+                            ix_source,
+                        ) {
+                            metrics.sim_alphaq_owner_rpc_retry_ok.fetch_add(1, Ordering::Relaxed);
+                            return Ok(outcome);
+                        }
                     } else {
                         compare_revert_with_rpc(
                             cache,
@@ -1249,7 +1477,7 @@ impl Simulator {
                             metrics,
                         );
                         if should_retry_with_rpc_snapshot(&program, &lite_err, &meta.meta.logs) {
-                            self.retry_with_rpc_snapshot(
+                            if let Some(outcome) = self.retry_with_rpc_snapshot(
                                 &program,
                                 cache,
                                 tx,
@@ -1264,7 +1492,9 @@ impl Simulator {
                                 route_programs,
                                 &lite_err,
                                 ix_source,
-                            );
+                            ) {
+                                return Ok(outcome);
+                            }
                         }
                     }
                 }
@@ -1347,16 +1577,11 @@ fn is_declared_program_id_mismatch(lite_err: &str, logs: &[String]) -> bool {
 }
 
 fn should_retry_with_rpc_snapshot(
-    failed_program: &Pubkey,
-    lite_err: &str,
-    logs: &[String],
+    _failed_program: &Pubkey,
+    _lite_err: &str,
+    _logs: &[String],
 ) -> bool {
-    *failed_program == SOLFI_V2_PROGRAM_ID
-        || lite_err.contains("Custom(23)")
-        || lite_err.contains("custom program error: 0x17")
-        || logs
-            .iter()
-            .any(|line| line.contains("custom program error: 0x17"))
+    true
 }
 
 fn is_invalid_account_owner(lite_err: &str, logs: &[String]) -> bool {
@@ -1550,6 +1775,26 @@ fn transaction_mentions_program(
     resolve_tx_account_keys(tx, alts)
         .iter()
         .any(|pk| pk == program)
+}
+
+/// The set of registered DEX/aggregator program ids referenced by this tx.
+/// Used to attribute simulation outcomes to specific exchanges.
+fn dex_programs_in_tx(
+    tx: &VersionedTransaction,
+    alts: &[AddressLookupTableAccount],
+) -> Vec<Pubkey> {
+    let registry: HashSet<Pubkey> = crate::program_registry::PROGRAMS
+        .iter()
+        .filter_map(|(id, _)| Pubkey::try_from(*id).ok())
+        .collect();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for pk in resolve_tx_account_keys(tx, alts) {
+        if registry.contains(&pk) && seen.insert(pk) {
+            out.push(pk);
+        }
+    }
+    out
 }
 
 fn jupiter_route_account_keys_for_program(
@@ -1877,6 +2122,92 @@ fn dump_jupiter_route_accounts_for_program(
                     synthetic_readonly_system_accounts,
                     created_by_setup,
                 );
+            }
+        }
+    }
+}
+
+/// For a route that LiteSVM rejected with `InvalidAccountOwner` (but which
+/// succeeds on-chain), dump — for every account in the failing program's
+/// Jupiter instruction — the owner LiteSVM actually held vs the owner RPC
+/// reports. Any line with `owner_match=false` is the smoking gun: an account
+/// whose owner LiteSVM got wrong (e.g. a synthetic System-owned placeholder
+/// injected over a real DEX/token account), which is exactly what makes the
+/// program's internal owner check fail locally while passing on-chain.
+fn dump_failing_program_owner_diagnosis(
+    svm: &LiteSVM,
+    failing_program: &Pubkey,
+    tx: &VersionedTransaction,
+    alts: &[AddressLookupTableAccount],
+    rpc_accounts: &HashMap<Pubkey, AccountFetchResult>,
+    route_sig: u128,
+    ix_source: &str,
+) {
+    let resolved_keys = resolve_tx_account_keys(tx, alts);
+
+    let mut handle_instruction = |program_id_index: u8, account_indexes: &[u8], ix_index: usize| {
+        let Some(program_id) = resolved_keys.get(program_id_index as usize) else {
+            return;
+        };
+        if *program_id != JUPITER_PROGRAM_ID {
+            return;
+        }
+        let mentions = account_indexes
+            .iter()
+            .any(|i| resolved_keys.get(*i as usize) == Some(failing_program));
+        if !mentions {
+            return;
+        }
+        for (slot, raw_idx) in account_indexes.iter().enumerate() {
+            let Some(pk) = resolved_keys.get(*raw_idx as usize) else {
+                continue;
+            };
+            let svm_owner = svm
+                .get_account(&pk_to_addr(*pk))
+                .map(|a| a.owner().to_string())
+                .unwrap_or_else(|| "absent".to_string());
+            let (rpc_owner, rpc_status) = match rpc_accounts.get(pk) {
+                Some(AccountFetchResult::Found(a)) => (a.owner().to_string(), "found"),
+                Some(AccountFetchResult::NotFound) => ("none".to_string(), "not_found"),
+                Some(AccountFetchResult::Error { .. }) => ("?".to_string(), "rpc_error"),
+                None => ("?".to_string(), "no_result"),
+            };
+            let owner_match = rpc_status == "found" && svm_owner == rpc_owner;
+            // Flag the two failure shapes: (a) LiteSVM presents System-owner for
+            // an account RPC says is non-System; (b) any owner divergence.
+            let flag = if rpc_status == "found" && svm_owner != rpc_owner {
+                "OWNER_MISMATCH"
+            } else if svm_owner == "absent" {
+                "ABSENT_IN_SVM"
+            } else {
+                "ok"
+            };
+            eprintln!(
+                "[sim_owner_diagnosis] route_sig={:032x} source={} failing_program={} jupiter_ix_index={} account_slot={} pubkey={} svm_owner={} rpc_owner={} rpc_status={} owner_match={} flag={}",
+                route_sig,
+                ix_source,
+                failing_program,
+                ix_index,
+                slot,
+                pk,
+                svm_owner,
+                rpc_owner,
+                rpc_status,
+                owner_match,
+                flag
+            );
+        }
+    };
+
+    match &tx.message {
+        VersionedMessage::Legacy(msg) => {
+            for (ix_index, ix) in msg.instructions.iter().enumerate() {
+                handle_instruction(ix.program_id_index, &ix.accounts, ix_index);
+            }
+        }
+        VersionedMessage::V0(v0) => {
+            for (ix_index, ix) in v0.instructions.iter().enumerate() {
+                handle_instruction(ix.program_id_index, &ix.accounts, ix_index);
             }
         }
     }
@@ -2771,6 +3102,7 @@ impl SimulatorPool {
         manual_accounts_root: PathBuf,
         current_slot: Arc<AtomicU64>,
         current_unix_timestamp: Arc<AtomicI64>,
+        missing_handle: Option<Arc<crate::auto_missing_accounts::AutoMissingAccountsHandle>>,
     ) -> Result<Self> {
         let workers = workers.max(1);
         let mut sims = Vec::with_capacity(workers);
@@ -2784,6 +3116,7 @@ impl SimulatorPool {
                 manual_accounts_root.clone(),
                 current_slot.clone(),
                 current_unix_timestamp.clone(),
+                missing_handle.clone(),
             )
             .with_context(|| format!("failed to build sim worker #{i}"))?;
             sims.push(Arc::new(sim));
