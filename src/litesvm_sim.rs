@@ -69,8 +69,8 @@ const WHIRLPOOL_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc");
 const SOLFI_V2_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF");
-const MAX_RPC_SIM_COMPARE_PER_PROCESS: u64 = 20;
-const MAX_RPC_SNAPSHOT_RETRY_PER_PROCESS: u64 = 20;
+const MAX_RPC_SIM_COMPARE_PER_PROCESS: u64 = 1_000;
+const MAX_RPC_SNAPSHOT_RETRY_PER_PROCESS: u64 = u64::MAX;
 const MAX_SIM_CLOCK_LOGS_PER_PROCESS: u64 = 100;
 static RPC_SIM_COMPARE_COUNT: AtomicU64 = AtomicU64::new(0);
 static RPC_SNAPSHOT_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -1397,16 +1397,11 @@ fn is_declared_program_id_mismatch(lite_err: &str, logs: &[String]) -> bool {
 }
 
 fn should_retry_with_rpc_snapshot(
-    failed_program: &Pubkey,
-    lite_err: &str,
-    logs: &[String],
+    _failed_program: &Pubkey,
+    _lite_err: &str,
+    _logs: &[String],
 ) -> bool {
-    *failed_program == SOLFI_V2_PROGRAM_ID
-        || lite_err.contains("Custom(23)")
-        || lite_err.contains("custom program error: 0x17")
-        || logs
-            .iter()
-            .any(|line| line.contains("custom program error: 0x17"))
+    true
 }
 
 fn is_invalid_account_owner(lite_err: &str, logs: &[String]) -> bool {
