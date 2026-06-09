@@ -732,6 +732,25 @@ impl Simulator {
                     retry_diagnosis,
                     lite_err
                 );
+                // On-chain this route succeeds but LiteSVM rejects it with
+                // InvalidAccountOwner even on a 100%-fresh RPC snapshot. Dump the
+                // owner LiteSVM actually presented for each account in the failing
+                // program's instruction vs the owner RPC reports, so the exact
+                // mismatching account is pinpointed.
+                if is_invalid_account_owner(&retry_err, &meta.meta.logs) {
+                    let owner_failed_program =
+                        first_failed_program_for_invalid_owner(&meta.meta.logs)
+                            .unwrap_or(*failed_program);
+                    dump_failing_program_owner_diagnosis(
+                        &svm,
+                        &owner_failed_program,
+                        tx,
+                        alts,
+                        &rpc_fetch.accounts,
+                        route_sig,
+                        ix_source,
+                    );
+                }
                 None
             }
         }
@@ -2103,6 +2122,92 @@ fn dump_jupiter_route_accounts_for_program(
                     synthetic_readonly_system_accounts,
                     created_by_setup,
                 );
+            }
+        }
+    }
+}
+
+/// For a route that LiteSVM rejected with `InvalidAccountOwner` (but which
+/// succeeds on-chain), dump — for every account in the failing program's
+/// Jupiter instruction — the owner LiteSVM actually held vs the owner RPC
+/// reports. Any line with `owner_match=false` is the smoking gun: an account
+/// whose owner LiteSVM got wrong (e.g. a synthetic System-owned placeholder
+/// injected over a real DEX/token account), which is exactly what makes the
+/// program's internal owner check fail locally while passing on-chain.
+fn dump_failing_program_owner_diagnosis(
+    svm: &LiteSVM,
+    failing_program: &Pubkey,
+    tx: &VersionedTransaction,
+    alts: &[AddressLookupTableAccount],
+    rpc_accounts: &HashMap<Pubkey, AccountFetchResult>,
+    route_sig: u128,
+    ix_source: &str,
+) {
+    let resolved_keys = resolve_tx_account_keys(tx, alts);
+
+    let mut handle_instruction = |program_id_index: u8, account_indexes: &[u8], ix_index: usize| {
+        let Some(program_id) = resolved_keys.get(program_id_index as usize) else {
+            return;
+        };
+        if *program_id != JUPITER_PROGRAM_ID {
+            return;
+        }
+        let mentions = account_indexes
+            .iter()
+            .any(|i| resolved_keys.get(*i as usize) == Some(failing_program));
+        if !mentions {
+            return;
+        }
+        for (slot, raw_idx) in account_indexes.iter().enumerate() {
+            let Some(pk) = resolved_keys.get(*raw_idx as usize) else {
+                continue;
+            };
+            let svm_owner = svm
+                .get_account(&pk_to_addr(*pk))
+                .map(|a| a.owner().to_string())
+                .unwrap_or_else(|| "absent".to_string());
+            let (rpc_owner, rpc_status) = match rpc_accounts.get(pk) {
+                Some(AccountFetchResult::Found(a)) => (a.owner().to_string(), "found"),
+                Some(AccountFetchResult::NotFound) => ("none".to_string(), "not_found"),
+                Some(AccountFetchResult::Error { .. }) => ("?".to_string(), "rpc_error"),
+                None => ("?".to_string(), "no_result"),
+            };
+            let owner_match = rpc_status == "found" && svm_owner == rpc_owner;
+            // Flag the two failure shapes: (a) LiteSVM presents System-owner for
+            // an account RPC says is non-System; (b) any owner divergence.
+            let flag = if rpc_status == "found" && svm_owner != rpc_owner {
+                "OWNER_MISMATCH"
+            } else if svm_owner == "absent" {
+                "ABSENT_IN_SVM"
+            } else {
+                "ok"
+            };
+            eprintln!(
+                "[sim_owner_diagnosis] route_sig={:032x} source={} failing_program={} jupiter_ix_index={} account_slot={} pubkey={} svm_owner={} rpc_owner={} rpc_status={} owner_match={} flag={}",
+                route_sig,
+                ix_source,
+                failing_program,
+                ix_index,
+                slot,
+                pk,
+                svm_owner,
+                rpc_owner,
+                rpc_status,
+                owner_match,
+                flag
+            );
+        }
+    };
+
+    match &tx.message {
+        VersionedMessage::Legacy(msg) => {
+            for (ix_index, ix) in msg.instructions.iter().enumerate() {
+                handle_instruction(ix.program_id_index, &ix.accounts, ix_index);
+            }
+        }
+        VersionedMessage::V0(v0) => {
+            for (ix_index, ix) in v0.instructions.iter().enumerate() {
+                handle_instruction(ix.program_id_index, &ix.accounts, ix_index);
             }
         }
     }
