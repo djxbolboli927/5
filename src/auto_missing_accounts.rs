@@ -235,6 +235,7 @@ fn load_and_inject_cache(path: &Path, cache: &AccountCache) -> Result<usize> {
         return Ok(0);
     }
     let mut loaded = 0usize;
+    let mut resubscribed = 0usize;
     for rec in file.accounts {
         if rec.status != "valid" {
             continue;
@@ -253,7 +254,19 @@ fn load_and_inject_cache(path: &Path, cache: &AccountCache) -> Result<usize> {
                 rent_epoch: rec.rent_epoch,
             },
         );
+        // Re-arm the live subscription for writable accounts discovered in a
+        // previous run so they don't serve a stale on-disk snapshot.
+        if rec.needs_live_subscription {
+            cache.subscribe_account(pk);
+            resubscribed += 1;
+        }
         loaded += 1;
+    }
+    if resubscribed > 0 {
+        eprintln!(
+            "[missing_account_cache] resubscribed_live_accounts={}",
+            resubscribed
+        );
     }
     Ok(loaded)
 }
@@ -470,14 +483,20 @@ fn fetch_pending(
                                 });
                             }
 
-                            if needs_live && !live.iter().any(|r| r.pubkey == pk_str) {
-                                live.push(LiveRecord {
-                                    pubkey: pk_str.clone(),
-                                    owner: owner_str.clone(),
-                                    classification: class.clone(),
-                                    is_writable_seen: pending[idx].is_writable,
-                                    first_seen_unix: now,
-                                });
+                            if needs_live {
+                                // Keep this writable account fresh by adding it
+                                // to the live Yellowstone subscription, instead
+                                // of relying on this one-shot RPC snapshot.
+                                account_cache.subscribe_account(*pk);
+                                if !live.iter().any(|r| r.pubkey == pk_str) {
+                                    live.push(LiveRecord {
+                                        pubkey: pk_str.clone(),
+                                        owner: owner_str.clone(),
+                                        classification: class.clone(),
+                                        is_writable_seen: pending[idx].is_writable,
+                                        first_seen_unix: now,
+                                    });
+                                }
                             }
 
                             pending[idx].status = "cached".to_string();

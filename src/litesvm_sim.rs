@@ -536,6 +536,15 @@ impl Simulator {
                     // owned by a registered DEX program, Yellowstone's owner
                     // filter will keep the entry live going forward.
                     cache.insert_manual(*pk, account.clone());
+                    // Writable accounts NOT covered by the owner filter
+                    // (token vaults, foreign-owned PDAs) would otherwise go
+                    // stale again after this one-shot insert. Add them to the
+                    // live gRPC subscription so the stream keeps them fresh.
+                    if meta.is_writable {
+                        if let Ok(owner_pk) = Pubkey::try_from(account.owner().as_ref()) {
+                            cache.note_uncovered_writable(*pk, &owner_pk);
+                        }
+                    }
                     if let Err(e) = svm.set_account(pk_to_addr(*pk), account.clone()) {
                         eprintln!(
                             "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} failed_program={} status=account_inject_error pubkey={} error={:?}",
