@@ -480,7 +480,9 @@ impl Simulator {
             }
         };
 
-        let mut injected = 0usize;
+        let mut injected_rpc = 0usize;
+        let mut injected_synthetic = 0usize;
+        let mut synthetic_notfound_rpc = 0usize;
         let mut missing = 0usize;
         let mut rpc_errors = 0usize;
 
@@ -489,7 +491,7 @@ impl Simulator {
                 svm.set_account(pk_to_addr(alt.key), raw)
                     .map_err(|e| anyhow!("set snapshot ALT {} failed: {e:?}", alt.key))
             }) {
-                Ok(()) => injected += 1,
+                Ok(()) => injected_rpc += 1,
                 Err(e) => eprintln!(
                     "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} failed_program={} status=alt_inject_error alt={} error={}",
                     route_sig, ix_source, failed_program, alt.key, e
@@ -509,7 +511,7 @@ impl Simulator {
                         route_sig, ix_source, failed_program, pk, e
                     );
                 } else {
-                    injected += 1;
+                    injected_synthetic += 1;
                 }
                 continue;
             }
@@ -520,7 +522,7 @@ impl Simulator {
                         route_sig, ix_source, failed_program, pk, e
                     );
                 } else {
-                    injected += 1;
+                    injected_synthetic += 1;
                 }
                 continue;
             }
@@ -551,18 +553,39 @@ impl Simulator {
                             route_sig, ix_source, failed_program, pk, e
                         );
                     } else {
-                        injected += 1;
+                        injected_rpc += 1;
                     }
                 }
                 Some(AccountFetchResult::NotFound) | None => {
                     if synthetic_readonly_system_accounts.contains(pk) {
+                        // RPC also says this account doesn't exist. It may be an
+                        // uninitialized DEX account (e.g. tick array), which would
+                        // cause owner-check failures even on-chain. Log + queue for
+                        // background fetch to confirm.
+                        synthetic_notfound_rpc += 1;
+                        eprintln!(
+                            "[sim_retry_synthetic_notfound_rpc] route_sig={:032x} source={} failed_program={} pk={} is_writable={} note=account_not_found_on_rpc_injecting_synthetic_owner_check_may_fail",
+                            route_sig, ix_source, failed_program, pk, meta.is_writable
+                        );
+                        if let Some(handle) = &self.missing_handle {
+                            handle.record(crate::auto_missing_accounts::MissingAccountEvent {
+                                pubkey: *pk,
+                                route_sig,
+                                route_labels: route_labels.to_string(),
+                                programs: route_programs.to_string(),
+                                source: "retry_synthetic_notfound_rpc".to_string(),
+                                is_signer: meta.is_signer,
+                                is_writable: meta.is_writable,
+                                created_by_setup: false,
+                            });
+                        }
                         if let Err(e) = svm.set_account(pk_to_addr(*pk), synthetic_system_account(0)) {
                             eprintln!(
                                 "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} failed_program={} status=account_inject_error pubkey={} error={:?}",
                                 route_sig, ix_source, failed_program, pk, e
                             );
                         } else {
-                            injected += 1;
+                            injected_synthetic += 1;
                         }
                     } else if !created_by_setup.contains(pk) {
                         missing += 1;
@@ -590,18 +613,23 @@ impl Simulator {
             }
         }
 
+        let injected = injected_rpc + injected_synthetic;
+
         if missing > 0 || rpc_errors > 0 {
             metrics
                 .sim_retry_rpc_snapshot_fail
                 .fetch_add(1, Ordering::Relaxed);
             eprintln!(
-                "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} route_labels={} programs={} failed_program={} status=missing_snapshot_accounts injected={} missing={} rpc_errors={} cache_slot={} rpc_context_slot={} slot_delta={} lite_err={}",
+                "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} route_labels={} programs={} failed_program={} status=missing_snapshot_accounts injected={} injected_rpc={} injected_synthetic={} synthetic_notfound_rpc={} missing={} rpc_errors={} cache_slot={} rpc_context_slot={} slot_delta={} lite_err={}",
                 route_sig,
                 ix_source,
                 route_labels,
                 route_programs,
                 failed_program,
                 injected,
+                injected_rpc,
+                injected_synthetic,
+                synthetic_notfound_rpc,
                 missing,
                 rpc_errors,
                 cache_slot,
@@ -646,7 +674,7 @@ impl Simulator {
                     ("pass_unprofitable", false)
                 };
                 eprintln!(
-                    "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} route_labels={} programs={} failed_program={} status=ok result={} injected={} cache_slot={} rpc_context_slot={} slot_delta={} compute_units={} wsol_before={} wsol_after={} min_after={} diagnosis=stale_cache_possible lite_err={}",
+                    "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} route_labels={} programs={} failed_program={} status=ok result={} injected={} injected_rpc={} injected_synthetic={} synthetic_notfound_rpc={} cache_slot={} rpc_context_slot={} slot_delta={} compute_units={} wsol_before={} wsol_after={} min_after={} diagnosis=stale_cache_possible lite_err={}",
                     route_sig,
                     ix_source,
                     route_labels,
@@ -654,6 +682,9 @@ impl Simulator {
                     failed_program,
                     result_kind,
                     injected,
+                    injected_rpc,
+                    injected_synthetic,
+                    synthetic_notfound_rpc,
                     cache_slot,
                     rpc_context_slot,
                     slot_delta,
@@ -677,19 +708,28 @@ impl Simulator {
                     .sim_retry_rpc_snapshot_fail
                     .fetch_add(1, Ordering::Relaxed);
                 let retry_err = format!("{:?}", meta.err);
+                let retry_diagnosis = if synthetic_notfound_rpc > 0 {
+                    "synthetic_accounts_not_on_rpc_likely_uninitialized"
+                } else {
+                    "route_or_logic_issue_possible"
+                };
                 eprintln!(
-                    "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} route_labels={} programs={} failed_program={} status=fail injected={} cache_slot={} rpc_context_slot={} slot_delta={} retry_err={} compute_units={} diagnosis=route_or_logic_issue_possible lite_err={}",
+                    "[sim_retry_with_rpc_snapshot] route_sig={:032x} source={} route_labels={} programs={} failed_program={} status=fail injected={} injected_rpc={} injected_synthetic={} synthetic_notfound_rpc={} cache_slot={} rpc_context_slot={} slot_delta={} retry_err={} compute_units={} diagnosis={} lite_err={}",
                     route_sig,
                     ix_source,
                     route_labels,
                     route_programs,
                     failed_program,
                     injected,
+                    injected_rpc,
+                    injected_synthetic,
+                    synthetic_notfound_rpc,
                     cache_slot,
                     rpc_context_slot,
                     slot_delta,
                     retry_err,
                     meta.meta.compute_units_consumed,
+                    retry_diagnosis,
                     lite_err
                 );
                 None
@@ -857,6 +897,29 @@ impl Simulator {
                         meta.source.as_str()
                     );
                     synthetic_readonly_system_accounts.insert(*pk);
+                    // Queue for background fetch: if this account is owned by a DEX
+                    // program (e.g. AlphaQ tick arrays), giving it a synthetic
+                    // System-owned account will fail the DEX's ownership check.
+                    // The auto_missing service fetches it once; gRPC owner-filter
+                    // keeps it fresh on subsequent slots.
+                    if let Some(handle) = &self.missing_handle {
+                        handle.record(crate::auto_missing_accounts::MissingAccountEvent {
+                            pubkey: *pk,
+                            route_sig,
+                            route_labels: route_labels.to_string(),
+                            programs: route_programs.to_string(),
+                            source: "synthetic_alt_readonly".to_string(),
+                            is_signer: meta.is_signer,
+                            is_writable: meta.is_writable,
+                            created_by_setup: false,
+                        });
+                    }
+                    if contains_alphaq && alphaq_route_accounts.contains(pk) {
+                        eprintln!(
+                            "[sim_alphaq_synthetic_candidate] pk={} source={} note=alphaq_may_check_owner_of_this_account_and_fail",
+                            pk, meta.source.as_str()
+                        );
+                    }
                 } else {
                     if contains_alphaq && alphaq_route_accounts.contains(pk) {
                         log_missing_alphaq_route_account(meta, "hot_path_rpc_disabled_no_synthetic");
@@ -934,6 +997,24 @@ impl Simulator {
                             meta.source.as_str()
                         );
                         synthetic_readonly_system_accounts.insert(*pk);
+                        if let Some(handle) = &self.missing_handle {
+                            handle.record(crate::auto_missing_accounts::MissingAccountEvent {
+                                pubkey: *pk,
+                                route_sig,
+                                route_labels: route_labels.to_string(),
+                                programs: route_programs.to_string(),
+                                source: "synthetic_alt_readonly_not_found".to_string(),
+                                is_signer: meta.is_signer,
+                                is_writable: meta.is_writable,
+                                created_by_setup: false,
+                            });
+                        }
+                        if contains_alphaq && alphaq_route_accounts.contains(pk) {
+                            eprintln!(
+                                "[sim_alphaq_synthetic_candidate] pk={} source={} reason=not_found note=alphaq_may_check_owner_of_this_account_and_fail",
+                                pk, meta.source.as_str()
+                            );
+                        }
                     } else {
                         if contains_alphaq && alphaq_route_accounts.contains(pk) {
                             log_missing_alphaq_route_account(meta, "not_found_no_synthetic");
@@ -958,6 +1039,24 @@ impl Simulator {
                             meta.source.as_str()
                         );
                         synthetic_readonly_system_accounts.insert(*pk);
+                        if let Some(handle) = &self.missing_handle {
+                            handle.record(crate::auto_missing_accounts::MissingAccountEvent {
+                                pubkey: *pk,
+                                route_sig,
+                                route_labels: route_labels.to_string(),
+                                programs: route_programs.to_string(),
+                                source: "synthetic_alt_readonly_rpc_error".to_string(),
+                                is_signer: meta.is_signer,
+                                is_writable: meta.is_writable,
+                                created_by_setup: false,
+                            });
+                        }
+                        if contains_alphaq && alphaq_route_accounts.contains(pk) {
+                            eprintln!(
+                                "[sim_alphaq_synthetic_candidate] pk={} source={} reason=rpc_error note=alphaq_may_check_owner_of_this_account_and_fail",
+                                pk, meta.source.as_str()
+                            );
+                        }
                     } else {
                         if contains_alphaq && alphaq_route_accounts.contains(pk) {
                             log_missing_alphaq_route_account(meta, "rpc_error_no_synthetic");
