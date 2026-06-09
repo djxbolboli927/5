@@ -62,6 +62,12 @@ pub struct RpcConfig {
     /// stale because finalized lags the processed stream by ~30+ slots.
     #[serde(default = "default_rpc_commitment")]
     pub commitment: String,
+    /// Additional public RPC endpoints tried in order when the primary RPC
+    /// fails an account-fetch (`getMultipleAccounts`). These are ONLY used
+    /// for account data — never for blockhash, transaction simulation, or
+    /// Jito submission. Leave empty to disable fallback.
+    #[serde(default)]
+    pub fallback_rpc_urls: Vec<String>,
 }
 
 fn default_rpc_commitment() -> String {

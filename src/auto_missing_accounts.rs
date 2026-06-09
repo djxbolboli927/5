@@ -174,7 +174,7 @@ struct AutoMissingAccountsService {
     errors_path: PathBuf,
     live_path: PathBuf,
     hard_missing_path: PathBuf,
-    rpc: Arc<RpcClient>,
+    rpcs: Arc<Vec<Arc<RpcClient>>>,
     account_cache: AccountCache,
     receiver: mpsc::Receiver<MissingAccountEvent>,
 }
@@ -183,8 +183,12 @@ struct AutoMissingAccountsService {
 pub fn start(
     manual_accounts_root: &Path,
     rpc: Arc<RpcClient>,
+    fallback_rpcs: Arc<Vec<Arc<RpcClient>>>,
     account_cache: AccountCache,
 ) -> AutoMissingAccountsHandle {
+    let mut all_rpcs = vec![rpc];
+    all_rpcs.extend(fallback_rpcs.iter().cloned());
+    let rpcs = Arc::new(all_rpcs);
     let (sender, receiver) = mpsc::channel(8192);
     let service = AutoMissingAccountsService {
         pending_path: manual_accounts_root.join("missing_sim_accounts_pending.json"),
@@ -192,7 +196,7 @@ pub fn start(
         errors_path: manual_accounts_root.join("missing_sim_account_errors.json"),
         live_path: manual_accounts_root.join("missing_sim_account_live.json"),
         hard_missing_path: manual_accounts_root.join("missing_accounts_8000.json"),
-        rpc,
+        rpcs,
         account_cache,
         receiver,
     };
@@ -321,7 +325,7 @@ impl AutoMissingAccountsService {
         let errors_path = self.errors_path.clone();
         let live_path = self.live_path.clone();
         let hard_missing_path = self.hard_missing_path.clone();
-        let rpc = self.rpc.clone();
+        let rpcs = self.rpcs.clone();
         let account_cache = self.account_cache.clone();
         let _ = tokio::task::spawn_blocking(move || {
             if let Err(e) = fetch_pending(
@@ -330,7 +334,7 @@ impl AutoMissingAccountsService {
                 &errors_path,
                 &live_path,
                 &hard_missing_path,
-                &rpc,
+                &rpcs,
                 &account_cache,
             ) {
                 eprintln!("[missing_account_fetch] error={}", e);
@@ -341,6 +345,34 @@ impl AutoMissingAccountsService {
 }
 
 // ── Core logic (runs on blocking thread) ─────────────────────────────────────
+
+/// Try `getMultipleAccounts` on `rpcs[0]`, falling back to `rpcs[1..]` on error.
+/// `rpcs` must be non-empty; the caller (start()) always prepends the primary.
+fn get_multiple_with_fallback(
+    rpcs: &[Arc<RpcClient>],
+    keys: &[Pubkey],
+) -> solana_client::client_error::Result<Vec<Option<solana_sdk::account::Account>>> {
+    match rpcs[0].get_multiple_accounts(keys) {
+        Ok(r) => Ok(r),
+        Err(primary_err) => {
+            for (i, fb) in rpcs[1..].iter().enumerate() {
+                match fb.get_multiple_accounts(keys) {
+                    Ok(r) => {
+                        eprintln!(
+                            "[rpc_fallback] accounts={} primary_err={} used_fallback_idx={}",
+                            keys.len(),
+                            primary_err,
+                            i
+                        );
+                        return Ok(r);
+                    }
+                    Err(_) => continue,
+                }
+            }
+            Err(primary_err)
+        }
+    }
+}
 
 fn flush_events_to_pending(path: &Path, events: &[MissingAccountEvent]) -> Result<()> {
     if let Some(p) = path.parent() {
@@ -390,7 +422,7 @@ fn fetch_pending(
     errors_path: &Path,
     live_path: &Path,
     hard_missing_path: &Path,
-    rpc: &RpcClient,
+    rpcs: &[Arc<RpcClient>],
     account_cache: &AccountCache,
 ) -> Result<()> {
     let mut pending = read_pending(pending_path)?;
@@ -426,7 +458,7 @@ fn fetch_pending(
         // Rate-limit: 200ms between chunks
         std::thread::sleep(Duration::from_millis(200));
 
-        match rpc.get_multiple_accounts(&pubkeys) {
+        match get_multiple_with_fallback(rpcs, &pubkeys) {
             Ok(results) => {
                 for (&idx, (pk, maybe_acct)) in
                     chunk_indices.iter().zip(pubkeys.iter().zip(results.iter()))

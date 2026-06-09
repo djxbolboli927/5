@@ -41,6 +41,10 @@ use yellowstone_grpc_proto::prelude::{
 pub struct AccountCache {
     inner: Arc<DashMap<Pubkey, Account>>,
     rpc: Arc<RpcClient>,
+    /// Extra RPC endpoints tried in order when `rpc` fails a
+    /// `getMultipleAccounts` call. Used ONLY for account data — never for
+    /// blockhash queries, transaction simulation, or Jito submission.
+    fallback_rpcs: Arc<Vec<Arc<RpcClient>>>,
     /// Slot of the most recent Yellowstone account update. The simulator
     /// reads this to set LiteSVM's Clock.slot — no RPC call needed.
     stream_slot: Arc<AtomicU64>,
@@ -101,9 +105,14 @@ struct TxStaticAccountCacheEntry {
 
 impl AccountCache {
     pub fn new(rpc: Arc<RpcClient>) -> Self {
+        Self::new_with_fallbacks(rpc, Arc::new(vec![]))
+    }
+
+    pub fn new_with_fallbacks(rpc: Arc<RpcClient>, fallback_rpcs: Arc<Vec<Arc<RpcClient>>>) -> Self {
         Self {
             inner: Arc::new(DashMap::with_capacity(4096)),
             rpc,
+            fallback_rpcs,
             stream_slot: Arc::new(AtomicU64::new(0)),
             stream_unix_timestamp: Arc::new(AtomicI64::new(fallback_unix_timestamp())),
             timestamp_seed_slot: Arc::new(AtomicU64::new(0)),
@@ -113,6 +122,35 @@ impl AccountCache {
             dynamic_accounts: Arc::new(Mutex::new(HashSet::new())),
             resubscribe_notify: Arc::new(Notify::new()),
             dex_owner_set: Arc::new(RwLock::new(HashSet::new())),
+        }
+    }
+
+    /// Call `getMultipleAccounts` on the primary RPC. If it fails, try each
+    /// fallback in order. Only account-data paths use this — never blockhash
+    /// or transaction simulation.
+    fn get_multiple_accounts_with_fallback(
+        &self,
+        keys: &[Pubkey],
+    ) -> solana_client::client_error::Result<Vec<Option<solana_sdk::account::Account>>> {
+        match self.rpc.get_multiple_accounts(keys) {
+            Ok(r) => return Ok(r),
+            Err(primary_err) => {
+                for (i, fallback) in self.fallback_rpcs.iter().enumerate() {
+                    match fallback.get_multiple_accounts(keys) {
+                        Ok(r) => {
+                            eprintln!(
+                                "[rpc_fallback] accounts={} primary_err={} used_fallback_idx={}",
+                                keys.len(),
+                                primary_err,
+                                i
+                            );
+                            return Ok(r);
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                Err(primary_err)
+            }
         }
     }
 
@@ -317,7 +355,7 @@ impl AccountCache {
             loop {
                 attempt += 1;
                 log_rpc_fetch_reason("tx_static_unknown", &chunk_keys);
-                match self.rpc.get_multiple_accounts(&chunk_keys) {
+                match self.get_multiple_accounts_with_fallback(&chunk_keys) {
                     Ok(accounts) => {
                         for (pk, acct_opt) in chunk_keys.iter().zip(accounts.into_iter()) {
                             match acct_opt {
@@ -413,10 +451,29 @@ impl AccountCache {
                     requests += 1;
                     log_rpc_fetch_reason("tx_static_unknown", &chunk_keys);
                     let rpc = self.rpc.clone();
+                    let fallback_rpcs = self.fallback_rpcs.clone();
                     let request_keys = chunk_keys.clone();
-                    let result =
-                        tokio::task::spawn_blocking(move || rpc.get_multiple_accounts(&request_keys))
-                            .await;
+                    let result = tokio::task::spawn_blocking(move || {
+                        match rpc.get_multiple_accounts(&request_keys) {
+                            Ok(r) => Ok(r),
+                            Err(primary_err) => {
+                                for (i, fb) in fallback_rpcs.iter().enumerate() {
+                                    match fb.get_multiple_accounts(&request_keys) {
+                                        Ok(r) => {
+                                            eprintln!(
+                                                "[rpc_fallback] accounts={} primary_err={} used_fallback_idx={}",
+                                                request_keys.len(), primary_err, i
+                                            );
+                                            return Ok(r);
+                                        }
+                                        Err(_) => continue,
+                                    }
+                                }
+                                Err(primary_err)
+                            }
+                        }
+                    })
+                    .await;
 
                     match result {
                         Ok(Ok(accounts)) => {
@@ -513,7 +570,7 @@ impl AccountCache {
         for chunk in keys.chunks(100) {
             let chunk_keys = chunk.to_vec();
             log_rpc_fetch_reason("failed_account_compare", &chunk_keys);
-            match self.rpc.get_multiple_accounts(&chunk_keys) {
+            match self.get_multiple_accounts_with_fallback(&chunk_keys) {
                 Ok(accounts) => {
                     for (pk, acct_opt) in chunk_keys.iter().zip(accounts.into_iter()) {
                         match acct_opt {

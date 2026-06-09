@@ -44,6 +44,13 @@ url = "https://rpc.fra.shyft.to?api_key=farYqEW-7r1vxqok"
 # (which is "processed"). Using "finalized" makes every actively-traded pool
 # look stale (~30+ slot lag) and feeds the retry path data older than the cache.
 commitment = "processed"
+# Fallback RPCs used ONLY for getMultipleAccounts when the primary RPC fails.
+# Never used for trading, blockhash, or Jito submission.
+fallback_rpc_urls = [
+    "https://api.mainnet-beta.solana.com",
+    "https://rpc.ankr.com/solana",
+    "https://solana-mainnet.rpc.extrnode.com",
+]
 
 [yellowstone_grpc]
 endpoint = "https://solana-yellowstone-grpc.publicnode.com:443"

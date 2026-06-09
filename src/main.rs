@@ -113,6 +113,17 @@ async fn async_main(config: config::Config) -> Result<()> {
         config.rpc.url.clone(),
         rpc_commitment,
     ));
+    let fallback_rpcs: Arc<Vec<Arc<RpcClient>>> = Arc::new(
+        config
+            .rpc
+            .fallback_rpc_urls
+            .iter()
+            .map(|url| Arc::new(RpcClient::new_with_commitment(url.clone(), rpc_commitment)))
+            .collect(),
+    );
+    if !fallback_rpcs.is_empty() {
+        eprintln!("[rpc_fallback] configured {} fallback RPC(s)", fallback_rpcs.len());
+    }
 
     let wsol_mint = solana_sdk::pubkey::Pubkey::from_str_const(tokens::WSOL_MINT);
     let wsol_ata = spl_associated_token_account::get_associated_token_address(
@@ -174,7 +185,10 @@ async fn async_main(config: config::Config) -> Result<()> {
     };
 
     let (sim_cache, sim_pool, mix_registry) = if config.simulation.enabled {
-        let cache = account_cache::AccountCache::new(rpc_client.clone());
+        let cache = account_cache::AccountCache::new_with_fallbacks(
+            rpc_client.clone(),
+            fallback_rpcs.clone(),
+        );
         let manual_accounts_root =
             manual_sim_accounts::output_root_from_dex_dir(&config.simulation.dex_dir);
         let manual_sim_accounts_path = manual_accounts_root.join("manual_sim_accounts.json");
@@ -200,6 +214,7 @@ async fn async_main(config: config::Config) -> Result<()> {
         let missing_handle = Arc::new(auto_missing_accounts::start(
             &manual_accounts_root,
             rpc_client.clone(),
+            fallback_rpcs.clone(),
             cache.clone(),
         ));
 
