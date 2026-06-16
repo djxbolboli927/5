@@ -146,7 +146,9 @@ impl MetisClient {
             if only_direct {
                 "&onlyDirectRoutes=true"
             } else {
-                "&restrictIntermediateTokens=true"
+                // multi-hop/free-route mode disabled: force direct routes on all requests.
+                // To re-enable multi-hop, replace this with "&restrictIntermediateTokens=true".
+                "&onlyDirectRoutes=true"
             }
         );
 
